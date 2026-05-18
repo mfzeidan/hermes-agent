@@ -287,6 +287,97 @@ class TestWebhookRouting:
         assert ev.media_types == ["image/jpeg"]
 
     @pytest.mark.asyncio
+    async def test_text_webhook_caches_audio_mms_attachment(self, monkeypatch, tmp_path):
+        import gateway.platforms.inkbox as inkbox_mod
+
+        adapter = _make_adapter(monkeypatch)
+        captured = []
+        cache_calls = []
+
+        async def fake_handle_message(event):
+            captured.append(event)
+
+        async def fake_cache_audio_from_url(url, ext=".ogg", retries=2):
+            cache_calls.append((url, ext, retries))
+            return str(tmp_path / f"cached{ext}")
+
+        async def fake_convert_audio_for_stt(local_path, content_type):
+            return str(tmp_path / "cached.wav"), "audio/wav"
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(inkbox_mod, "cache_audio_from_url", fake_cache_audio_from_url)
+        monkeypatch.setattr(inkbox_mod, "_maybe_convert_audio_for_stt", fake_convert_audio_for_stt)
+
+        envelope = {
+            "event_type": "text.received",
+            "data": {"text_message": {
+                "id": "mms-audio",
+                "remote_phone_number": "+15555550101",
+                "local_phone_number": "+18005550100",
+                "text": "",
+                "direction": "inbound",
+                "created_at": "2026-04-27T20:00:00Z",
+                "media": [{
+                    "url": "https://media.example.test/voice.amr?sig=example",
+                    "content_type": "audio/amr",
+                }],
+            }},
+        }
+        await adapter._handle_webhook(_FakeRequest(json.dumps(envelope).encode()))
+        await _drain_background(adapter)
+
+        assert len(captured) == 1
+        ev = captured[0]
+        assert "[MMS attachment received: audio/amr]" in ev.text
+        assert "media.example.test" not in ev.text
+        assert ev.media_urls == [str(tmp_path / "cached.wav")]
+        assert ev.media_types == ["audio/wav"]
+        assert cache_calls == [
+            ("https://media.example.test/voice.amr?sig=example", ".amr", 2),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_text_webhook_drops_audio_mms_url_when_cache_fails(self, monkeypatch):
+        import gateway.platforms.inkbox as inkbox_mod
+
+        adapter = _make_adapter(monkeypatch)
+        captured = []
+
+        async def fake_handle_message(event):
+            captured.append(event)
+
+        async def fake_cache_audio_from_url(url, ext=".ogg", retries=2):
+            raise RuntimeError("temporary media URL expired")
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(inkbox_mod, "cache_audio_from_url", fake_cache_audio_from_url)
+
+        envelope = {
+            "event_type": "text.received",
+            "data": {"text_message": {
+                "id": "mms-audio-expired",
+                "remote_phone_number": "+15555550101",
+                "local_phone_number": "+18005550100",
+                "text": "",
+                "direction": "inbound",
+                "created_at": "2026-04-27T20:00:00Z",
+                "media": [{
+                    "url": "https://media.example.test/voice.amr?sig=example",
+                    "content_type": "audio/amr",
+                }],
+            }},
+        }
+        await adapter._handle_webhook(_FakeRequest(json.dumps(envelope).encode()))
+        await _drain_background(adapter)
+
+        assert len(captured) == 1
+        ev = captured[0]
+        assert "[MMS attachment received: audio/amr]" in ev.text
+        assert "media.example.test" not in ev.text
+        assert ev.media_urls == []
+        assert ev.media_types == []
+
+    @pytest.mark.asyncio
     async def test_text_webhook_surfaces_multiple_mms_attachments(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         captured = []

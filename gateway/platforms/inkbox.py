@@ -68,10 +68,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket as _socket
 import time
 from contextlib import suppress
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -106,7 +108,13 @@ except ImportError:
     INKBOX_TUNNEL_AVAILABLE = False
 
 from gateway.config import INKBOX_BASE_URL_DEFAULT, Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    cache_audio_from_url,
+)
 from gateway.platforms.helpers import redact_phone
 
 logger = logging.getLogger(__name__)
@@ -170,6 +178,28 @@ SMS_PERMANENT_ERROR_CODES = frozenset({
     "invalid_phone_number",
     "message_too_long",
     "carrier_rejected",
+})
+SMS_AUDIO_EXTENSIONS_BY_CONTENT_TYPE: Dict[str, str] = {
+    "audio/aac": ".aac",
+    "audio/amr": ".amr",
+    "audio/flac": ".flac",
+    "audio/m4a": ".m4a",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/webm": ".webm",
+    "audio/x-m4a": ".m4a",
+    "audio/x-wav": ".wav",
+    "audio/3gpp": ".3gp",
+    "audio/3gpp2": ".3g2",
+}
+SMS_AUDIO_EXTENSIONS_REQUIRING_WAV_CONVERSION = frozenset({
+    ".amr",
+    ".3gp",
+    ".3g2",
 })
 
 # Hermes emits a few classes of admin/system notice via adapter.send() —
@@ -502,6 +532,104 @@ def _extract_text_media(text_msg: Dict[str, Any]) -> Tuple[list[str], list[str],
         types.append(media_type)
         markers.append(f"[MMS attachment received: {media_type}]")
     return urls, types, markers
+
+
+def _audio_extension_for_content_type(content_type: str) -> str:
+    media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    return SMS_AUDIO_EXTENSIONS_BY_CONTENT_TYPE.get(media_type, ".audio")
+
+
+def _short_text_id(text_id: str) -> str:
+    return str(text_id or "")[-8:] or "unknown"
+
+
+async def _maybe_convert_audio_for_stt(local_path: str, content_type: str) -> Tuple[str, str]:
+    """Convert carrier-oriented SMS audio to WAV when ffmpeg is available."""
+    path = Path(local_path)
+    if path.suffix.lower() not in SMS_AUDIO_EXTENSIONS_REQUIRING_WAV_CONVERSION:
+        return local_path, content_type
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return local_path, content_type
+
+    wav_path = str(path.with_suffix(".wav"))
+    proc = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        local_path,
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        wav_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _stdout, stderr = await proc.communicate()
+    if proc.returncode == 0 and Path(wav_path).exists():
+        return wav_path, "audio/wav"
+
+    details = (stderr or b"").decode(errors="replace").strip()
+    if len(details) > 300:
+        details = f"{details[:300]}..."
+    logger.warning(
+        "[Inkbox] Could not convert inbound SMS audio content_type=%s via ffmpeg: %s",
+        content_type,
+        details or f"exit {proc.returncode}",
+    )
+    return local_path, content_type
+
+
+async def _materialize_text_audio_media(
+    *,
+    media_urls: list[str],
+    media_types: list[str],
+    text_id: str,
+) -> Tuple[list[str], list[str]]:
+    """Download SMS/MMS audio URLs into local cache paths for Hermes STT.
+
+    Non-audio media remains unchanged. If audio download fails, drop that media
+    URL rather than leaking a temporary signed URL into agent-visible errors.
+    """
+    materialized_urls: list[str] = []
+    materialized_types: list[str] = []
+
+    for index, url in enumerate(media_urls):
+        media_type = media_types[index] if index < len(media_types) else "unknown"
+        if not str(media_type or "").lower().startswith("audio/"):
+            materialized_urls.append(url)
+            materialized_types.append(media_type)
+            continue
+
+        try:
+            ext = _audio_extension_for_content_type(media_type)
+            local_path = await cache_audio_from_url(url, ext=ext)
+            local_path, media_type = await _maybe_convert_audio_for_stt(
+                local_path,
+                media_type,
+            )
+            materialized_urls.append(local_path)
+            materialized_types.append(media_type)
+            logger.info(
+                "[Inkbox] Cached inbound SMS audio attachment text_id_suffix=%s content_type=%s",
+                _short_text_id(text_id),
+                media_type,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Inkbox] Failed to cache inbound SMS audio attachment "
+                "text_id_suffix=%s content_type=%s error=%s",
+                _short_text_id(text_id),
+                media_type,
+                type(exc).__name__,
+            )
+
+    return materialized_urls, materialized_types
 
 
 def _text_message_metadata(message: Any, *, mode: str) -> Dict[str, Any]:
@@ -1603,6 +1731,11 @@ class InkboxAdapter(BasePlatformAdapter):
         raw_body = text_msg.get("text") or ""
         body = raw_body
         media_urls, media_types, media_markers = _extract_text_media(text_msg)
+        media_urls, media_types = await _materialize_text_audio_media(
+            media_urls=media_urls,
+            media_types=media_types,
+            text_id=text_id,
+        )
         if media_markers:
             body = "\n".join(part for part in [body, *media_markers] if part)
         timestamp = _parse_inkbox_timestamp(text_msg.get("created_at"))
