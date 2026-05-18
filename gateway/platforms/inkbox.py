@@ -216,6 +216,7 @@ _ADMIN_NOTICE_PREFIXES: Tuple[str, ...] = (
     # place in a real SMS or email thread.
     "💻",  # terminal / bash
     "🔎",  # grep / search_files
+    "🔍",  # search / web search
     "📖",  # read
     "📝",  # write / edit
     "📚",  # skill load

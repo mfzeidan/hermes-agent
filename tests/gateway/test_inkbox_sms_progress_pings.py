@@ -43,6 +43,23 @@ class CaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class CaptureEditableAdapter(CaptureAdapter):
+    async def edit_message(
+        self,
+        chat_id,
+        message_id,
+        content,
+        *,
+        finalize=False,
+    ) -> SendResult:
+        self.sent.append({
+            "chat_id": chat_id,
+            "content": content,
+            "metadata": {"edited": True, "finalize": finalize},
+        })
+        return SendResult(success=True, message_id=message_id)
+
+
 class SlowAgent:
     def __init__(self, **kwargs):
         self.tools = []
@@ -57,6 +74,26 @@ class FastAgent:
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {"final_response": "final answer", "messages": [], "api_calls": 1}
+
+
+class ChatteryAgent:
+    def __init__(self, **kwargs):
+        self.tools = []
+        self.tool_progress_callback = None
+        self.interim_assistant_callback = None
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.tool_progress_callback:
+            self.tool_progress_callback(
+                "tool.started",
+                tool_name="web_search",
+                preview="private local plans query",
+                args={"query": "private local plans query"},
+            )
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback("Calling web_search now.")
+        time.sleep(0.15)
         return {"final_response": "final answer", "messages": [], "api_calls": 1}
 
 
@@ -82,7 +119,7 @@ def _make_runner(adapter):
     return runner
 
 
-def _install_fakes(monkeypatch, tmp_path, agent_cls):
+def _install_fakes(monkeypatch, tmp_path, agent_cls, *, display=None):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
     monkeypatch.setenv("HERMES_SMS_PROGRESS_INITIAL_SECONDS", "0.05")
     monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0")
@@ -105,12 +142,10 @@ def _install_fakes(monkeypatch, tmp_path, agent_cls):
     monkeypatch.setattr(
         gateway_run,
         "_load_gateway_config",
-        lambda: {
-            "display": {
-                "tool_progress": "off",
-                "interim_assistant_messages": False,
-            }
-        },
+        lambda: {"display": display if display is not None else {
+            "tool_progress": "off",
+            "interim_assistant_messages": False,
+        }},
     )
 
 
@@ -195,6 +230,40 @@ async def test_inkbox_sms_pending_followup_suppresses_progress_ping(monkeypatch,
 
     assert result["final_response"] == "final answer"
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_inkbox_sms_suppresses_tool_progress_and_interim_chatter(monkeypatch, tmp_path):
+    _install_fakes(
+        monkeypatch,
+        tmp_path,
+        ChatteryAgent,
+        display={"tool_progress": "all", "interim_assistant_messages": True},
+    )
+    adapter = CaptureEditableAdapter(Platform.INKBOX)
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.INKBOX,
+        chat_id="contact-123",
+        chat_type="dm",
+        user_id_alt="+15551234567",
+    )
+
+    result = await runner._run_agent(
+        message="please research this",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-sms-no-tool-chatter",
+        session_key="agent:main:inkbox:dm:contact-123",
+    )
+
+    assert result["final_response"] == "final answer"
+    assert adapter.sent == [{
+        "chat_id": "contact-123",
+        "content": "I am checking that now.",
+        "metadata": {"mode": "sms"},
+    }]
 
 
 @pytest.mark.asyncio

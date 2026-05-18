@@ -15358,15 +15358,33 @@ class GatewayRunner:
             if _env_tp and not _tool_progress_configured
             else (_resolved_tp or _env_tp or "all")
         )
-        # Disable tool progress for webhooks - they don't support message editing,
-        # so each progress line would be sent as a separate message.
+        # Inkbox SMS is also a non-editable user channel in practice. The
+        # adapter has an edit_message method for voice-call WebSockets, but SMS
+        # progress lines become separate real texts. Keep SMS quiet here and
+        # rely on the dedicated proof-of-life notifier below instead.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        _inkbox_thread_id = str(getattr(source, "thread_id", "") or "")
+        _inkbox_chat_topic = str(getattr(source, "chat_topic", "") or "")
+        _is_inkbox_sms_turn = (
+            source.platform == Platform.INKBOX
+            and not _inkbox_thread_id.startswith("call:")
+            and _inkbox_chat_topic != "voice_call"
+            and (
+                str(getattr(source, "user_id_alt", "") or "").startswith("+")
+                or str(getattr(source, "chat_id", "") or "").startswith("+")
+            )
+        )
+        tool_progress_enabled = (
+            progress_mode != "off"
+            and source.platform != Platform.WEBHOOK
+            and not _is_inkbox_sms_turn
+        )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
+            and not _is_inkbox_sms_turn
             and is_truthy_value(
                 display_config.get("interim_assistant_messages"),
                 default=True,
@@ -16746,17 +16764,7 @@ class GatewayRunner:
         # names, paths, or elapsed-time counters.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
-        _inkbox_thread_id = str(getattr(source, "thread_id", "") or "")
-        _inkbox_chat_topic = str(getattr(source, "chat_topic", "") or "")
-        _is_sms_progress_turn = (
-            source.platform == Platform.INKBOX
-            and not _inkbox_thread_id.startswith("call:")
-            and _inkbox_chat_topic != "voice_call"
-            and (
-                str(getattr(source, "user_id_alt", "") or "").startswith("+")
-                or str(getattr(source, "chat_id", "") or "").startswith("+")
-            )
-        )
+        _is_sms_progress_turn = _is_inkbox_sms_turn
         _SMS_PROGRESS_INITIAL_RAW = _float_env(
             "HERMES_SMS_PROGRESS_INITIAL_SECONDS",
             25,
