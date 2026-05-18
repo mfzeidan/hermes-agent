@@ -66,9 +66,12 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _INKBOX_SMS_HELP_TEXT_DEFAULT = (
-    "I can help route local vendor requests over SMS.\n"
-    "Text what you need, your location, and any timing/urgency. "
-    "Short follow-ups are fine; I wait a moment before replying.\n"
+    "Family Steward handles household follow-through over SMS: "
+    "groceries/checklists, tasks, calendar questions, local plans, meal ideas, "
+    "web research, and family context.\n"
+    "I can organize, remember, draft, compare, and keep items tracked. I won't "
+    "contact people, book/cancel, buy/pay, submit forms, or change calendars "
+    "unless you approve and that action is enabled.\n"
     "Commands: /help, /reset, /status, /stop. Text STOP to opt out."
 )
 
@@ -9734,7 +9737,11 @@ class GatewayRunner:
         if command == "status":
             if active_session_key:
                 return "I'm working on your last message. Send /stop to cancel or /reset to start over."
-            return "I'm online. Text what you need help finding; follow-up details are fine."
+            return (
+                "I'm online. Text groceries/checklists, tasks, calendar questions, "
+                "local plans, meal ideas, web research, or family context. Send "
+                "/help for scope."
+            )
         if command == "stop":
             if active_session_key:
                 await self._interrupt_and_clear_session(
@@ -9754,7 +9761,11 @@ class GatewayRunner:
                     invalidation_reason="inkbox_sms_reset_command",
                 )
             await self._handle_reset_command(event)
-            return "Started over. Text what you need help finding."
+            return (
+                "Started over. Text groceries/checklists, tasks, calendar questions, "
+                "local plans, meal ideas, web research, or family context. Send "
+                "/help for what I can and can't do."
+            )
         logger.info(
             "Blocked Inkbox SMS end-user command /%s from general Hermes command surface",
             typed,

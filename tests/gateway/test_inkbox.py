@@ -991,6 +991,9 @@ class TestInkboxSmsCommandSurface:
         result = await self._runner()._handle_help_command(self._sms_event("/help"))
 
         assert len(result) < 500
+        assert "Family Steward handles household follow-through over SMS" in result
+        assert "groceries/checklists" in result
+        assert "I won't contact people" in result
         assert "Commands: /help, /reset, /status, /stop" in result
         assert "/model" not in result
         assert "/debug" not in result
@@ -1009,8 +1012,36 @@ class TestInkboxSmsCommandSurface:
         result = await self._runner()._handle_commands_command(self._sms_event("/commands"))
 
         assert len(result) < 500
-        assert "Text what you need" in result
+        assert "Family Steward handles household follow-through over SMS" in result
+        assert "groceries/checklists" in result
         assert "/kanban" not in result
+
+    @pytest.mark.asyncio
+    async def test_sms_status_idle_is_product_safe(self):
+        result = await self._runner()._handle_inkbox_sms_user_command(
+            self._sms_event("/status"),
+            canonical_command="status",
+            typed_command="status",
+        )
+
+        assert result.startswith("I'm online.")
+        assert "groceries/checklists" in result
+        assert "/help" in result
+        assert "/model" not in result
+        assert "config" not in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_sms_reset_copy_is_product_safe(self):
+        result = await self._runner()._handle_inkbox_sms_user_command(
+            self._sms_event("/reset"),
+            canonical_command="new",
+            typed_command="reset",
+        )
+
+        assert result.startswith("Started over.")
+        assert "groceries/checklists" in result
+        assert "what I can and can't do" in result
+        assert "/model" not in result
 
     @pytest.mark.asyncio
     async def test_sms_dev_command_is_blocked(self):
