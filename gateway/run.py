@@ -16739,38 +16739,108 @@ class GatewayRunner:
         # Config: agent.gateway_notify_interval in config.yaml, or
         # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
         # 0 = disable notifications.
+        #
+        # Inkbox SMS has no typing indicator or editable progress bubble, so
+        # it gets a separate human-safe proof-of-life cadence. Keep the copy
+        # deliberately non-technical: no tool names, JSON, stack traces, model
+        # names, paths, or elapsed-time counters.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        _inkbox_thread_id = str(getattr(source, "thread_id", "") or "")
+        _inkbox_chat_topic = str(getattr(source, "chat_topic", "") or "")
+        _is_sms_progress_turn = (
+            source.platform == Platform.INKBOX
+            and not _inkbox_thread_id.startswith("call:")
+            and _inkbox_chat_topic != "voice_call"
+            and (
+                str(getattr(source, "user_id_alt", "") or "").startswith("+")
+                or str(getattr(source, "chat_id", "") or "").startswith("+")
+            )
+        )
+        _SMS_PROGRESS_INITIAL_RAW = _float_env(
+            "HERMES_SMS_PROGRESS_INITIAL_SECONDS",
+            25,
+        )
+        _SMS_PROGRESS_INTERVAL_RAW = _float_env(
+            "HERMES_SMS_PROGRESS_INTERVAL_SECONDS",
+            75,
+        )
+        _SMS_PROGRESS_INITIAL = (
+            _SMS_PROGRESS_INITIAL_RAW
+            if _SMS_PROGRESS_INITIAL_RAW > 0
+            else None
+        )
+        _SMS_PROGRESS_INTERVAL = max(_SMS_PROGRESS_INTERVAL_RAW, 60.0)
         _notify_start = time.time()
+        _executor_task = None
 
         async def _notify_long_running():
-            if _NOTIFY_INTERVAL is None:
+            if _is_sms_progress_turn:
+                if _SMS_PROGRESS_INITIAL is None:
+                    return
+                notify_delays = (
+                    _SMS_PROGRESS_INITIAL,
+                    _SMS_PROGRESS_INTERVAL,
+                )
+                sms_messages = (
+                    "I am checking that now.",
+                    "Still working on this; I have not forgotten.",
+                )
+            elif _NOTIFY_INTERVAL is not None:
+                notify_delays = (_NOTIFY_INTERVAL,)
+                sms_messages = ()
+            else:
                 return  # Notifications disabled (gateway_notify_interval: 0)
             _notify_adapter = self.adapters.get(source.platform)
             if not _notify_adapter:
                 return
+            notify_count = 0
             while True:
-                await asyncio.sleep(_NOTIFY_INTERVAL)
+                delay = notify_delays[0] if notify_count == 0 else notify_delays[-1]
+                await asyncio.sleep(delay)
+                if _executor_task is not None and _executor_task.done():
+                    return
+                if (
+                    _is_sms_progress_turn
+                    and session_key
+                    and hasattr(_notify_adapter, "has_pending_interrupt")
+                    and _notify_adapter.has_pending_interrupt(session_key)
+                ):
+                    return
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
-                # Include agent activity context if available.
-                _agent_ref = agent_holder[0]
-                _status_detail = ""
-                if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
-                    try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
-                        if _a.get("current_tool"):
-                            _parts.append(f"running: {_a['current_tool']}")
-                        else:
-                            _parts.append(_a.get("last_activity_desc", ""))
-                        _status_detail = " — " + ", ".join(_parts)
-                    except Exception:
-                        pass
+                if _is_sms_progress_turn:
+                    _notify_text = (
+                        sms_messages[0]
+                        if notify_count == 0
+                        else sms_messages[-1]
+                    )
+                    _notify_metadata = dict(_status_thread_metadata or {})
+                    _notify_metadata["mode"] = "sms"
+                else:
+                    # Include agent activity context if available.
+                    _agent_ref = agent_holder[0]
+                    _status_detail = ""
+                    if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
+                        try:
+                            _a = _agent_ref.get_activity_summary()
+                            _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
+                            if _a.get("current_tool"):
+                                _parts.append(f"running: {_a['current_tool']}")
+                            else:
+                                _parts.append(_a.get("last_activity_desc", ""))
+                            _status_detail = " — " + ", ".join(_parts)
+                        except Exception:
+                            pass
+                    _notify_text = (
+                        f"⏳ Still working... "
+                        f"({_elapsed_mins} min elapsed{_status_detail})"
+                    )
+                    _notify_metadata = _status_thread_metadata
                 try:
                     _notify_res = await _notify_adapter.send(
                         source.chat_id,
-                        f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
-                        metadata=_status_thread_metadata,
+                        _notify_text,
+                        metadata=_notify_metadata,
                     )
                     if (
                         _cleanup_progress
@@ -16780,6 +16850,7 @@ class GatewayRunner:
                         _cleanup_msg_ids.append(str(_notify_res.message_id))
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
+                notify_count += 1
 
         _notify_task = asyncio.create_task(_notify_long_running())
 
