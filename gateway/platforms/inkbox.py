@@ -2043,14 +2043,17 @@ class InkboxAdapter(BasePlatformAdapter):
             prior_txt = re.sub(r"\s+", " ", str(call_context.get("conversation_summary") or "")).strip()
             opening_txt = re.sub(r"\s+", " ", str(call_context.get("opening_line") or "")).strip()
             lines = [
-                "[inkbox:realtime_call_ended_summary_request]",
-                "You are Hermes receiving a completed phone-call handoff from the realtime voice bridge.",
-                "Write exactly one concise SMS back to the user in this thread summarizing what happened.",
-                "Use the transcript below as the source of truth. Preserve exact values that were confirmed during the call, including numbers.",
-                "If the caller gave a value and the voice agent repeated it back and the caller confirmed, report that confirmed value.",
+                "[inkbox:realtime_call_ended_handoff]",
+                "You are Hermes receiving the complete transcript of a finished realtime phone call.",
+                "Treat the caller's side of this transcript as the user's latest message in this SMS thread.",
+                "Handle the user's latest actionable intent from the call using the transcript plus existing Hermes conversation context.",
+                "If the caller asked for a post-call text follow-up, answer that request directly when possible.",
+                "If the request cannot be answered from available context, say what was captured and ask for the missing detail.",
+                "If there is no actionable request, send a concise call summary.",
+                "Use the transcript below as the source of truth for what was said during the call. Preserve exact values that were confirmed during the call, including numbers.",
                 "Do not mention internal systems, transcripts, tools, models, or this handoff prompt.",
-                "Do not call, book, pay, schedule, submit, or message any third party. Say no external action was taken unless the transcript proves otherwise.",
-                "Keep the SMS under 500 characters.",
+                "Do not call, book, pay, schedule, submit, or message any third party. Any external action remains approval-gated.",
+                "Keep the SMS under 700 characters.",
                 "",
                 "Call metadata:",
                 f"- call_id: {call_id or 'unknown'}",
@@ -2066,7 +2069,7 @@ class InkboxAdapter(BasePlatformAdapter):
                 "",
                 "Call transcript:",
                 _format_realtime_transcript_for_handoff(),
-                "[/inkbox:realtime_call_ended_summary_request]",
+                "[/inkbox:realtime_call_ended_handoff]",
             ])
             return "\n".join(lines)
 
@@ -2105,7 +2108,7 @@ class InkboxAdapter(BasePlatformAdapter):
                 message_type=MessageType.TEXT,
                 source=source,
                 raw_message={
-                    "event_type": "realtime.call_ended.summary_request",
+                    "event_type": "realtime.call_ended.handoff",
                     "call_id": call_id,
                     "direction": direction,
                     "has_context": bool(call_context),
@@ -2114,9 +2117,11 @@ class InkboxAdapter(BasePlatformAdapter):
                 message_id=f"call:{call_id or 'unknown'}:postcall-summary",
                 auto_skill=None,
                 channel_prompt=(
-                    "This is a post-call SMS summary turn. Do not use tools. "
-                    "Do not take external actions. Reply only with the concise "
-                    "user-facing SMS summary requested in the handoff."
+                    "This is a post-call transcript handoff turn. Treat the "
+                    "caller side of the transcript as the user's latest SMS intent. "
+                    "Use existing thread context when helpful. Do not take external "
+                    "actions; those remain approval-gated. Reply with one concise "
+                    "user-facing SMS."
                 ),
                 internal=True,
             )
