@@ -1930,8 +1930,11 @@ class InkboxAdapter(BasePlatformAdapter):
             "Allegiance, counting, spelling the alphabet, or speaking for a short duration, "
             "perform the diagnostic directly and then stop. When confirming a number, say "
             "exactly 'Got it: <number>.' and stop; do not add filler like 'I can capture that.' "
-            "Do not claim you can book, call, pay, schedule, or message anyone. If asked "
-            "to take an external action, say you can capture the request for later approval."
+            "A separate Hermes post-call handoff can text Mark a summary after hangup; "
+            "you may acknowledge that summary, but do not claim you personally can message "
+            "third parties. Do not claim you can book, call, pay, schedule, or message "
+            "anyone else. If asked to take an external action, say you can capture the "
+            "request for later approval."
         )
         reason = (call_context.get("reason") or "").strip()
         prior = (call_context.get("conversation_summary") or "").strip()
@@ -2254,9 +2257,19 @@ class InkboxAdapter(BasePlatformAdapter):
                         "max_output_tokens": 320,
                     },
                 }))
-                pending_opening_line = (call_context.get("opening_line") or "").strip()
-                if not pending_opening_line and direction == "outbound" and (reason or prior):
-                    pending_opening_line = "Greet the callee by name if known and briefly state why you are calling."
+                outbound_opener_enabled = _truthy(
+                    os.getenv("INKBOX_OPENAI_REALTIME_OUTBOUND_OPENER", "false")
+                )
+                pending_opening_line = ""
+                if outbound_opener_enabled:
+                    pending_opening_line = (call_context.get("opening_line") or "").strip()
+                    if not pending_opening_line and direction == "outbound" and (reason or prior):
+                        pending_opening_line = "Greet the callee by name if known and briefly state why you are calling."
+                elif direction == "outbound":
+                    logger.warning(
+                        "[Inkbox:realtime] Outbound opener disabled; waiting for caller transcript call_id=%s",
+                        call_id or "unknown",
+                    )
                 response_in_flight = False
                 pending_response_after_active = False
 
