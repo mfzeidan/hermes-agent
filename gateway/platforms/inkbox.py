@@ -64,6 +64,7 @@ semantics).
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -126,6 +127,10 @@ DEFAULT_WS_PATH = "/phone/media/ws"
 CONTACT_CACHE_TTL_SECONDS = 300
 WEBHOOK_DEDUP_TTL_SECONDS = 300
 SMS_MAX_LENGTH = 1600  # Inkbox SMS hard cap
+
+
+def _truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 SMS_TEXT_BATCH_DELAY_SECONDS = 0.0
 SMS_TEXT_BATCH_MAX_MESSAGES = 8
 SMS_TEXT_BATCH_MAX_CHARS = 4000
@@ -1843,6 +1848,610 @@ class InkboxAdapter(BasePlatformAdapter):
     # Inbound: WebSocket (live calls)
     # ------------------------------------------------------------------
 
+    async def _handle_call_ws_openai_realtime(self, request: "web.Request") -> "web.WebSocketResponse":
+        """Experimental Inkbox raw-audio bridge to OpenAI Realtime.
+
+        This is intentionally gated by ``INKBOX_OPENAI_REALTIME_VOICE`` and
+        currently bypasses Hermes entirely. Family Steward state/tool access
+        should be added later through explicit server-side function tools.
+        """
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            logger.warning(
+                "[Inkbox:realtime] OPENAI_API_KEY missing; rejecting realtime call"
+            )
+            return web.Response(status=503, text="realtime voice not configured")
+
+        try:
+            import websockets
+        except Exception as exc:
+            logger.warning("[Inkbox:realtime] websockets unavailable: %s", exc)
+            return web.Response(status=503, text="realtime voice unavailable")
+
+        call_id = request.query.get("call_id", "")
+        ctx_raw = request.headers.get("x-call-context", "") or ""
+        try:
+            ctx = json.loads(ctx_raw) if ctx_raw else {}
+        except json.JSONDecodeError:
+            ctx = {}
+        call_id = call_id or str(ctx.get("call_id") or ctx.get("id") or "")
+        direction = (ctx.get("direction") or "").strip().lower()
+        remote_phone_number = (ctx.get("remote_phone_number") or "").strip()
+        call_context: Dict[str, Any] = {}
+        ctx_token = (request.query.get("context_token") or "").strip()
+        if ctx_token:
+            try:
+                from hermes_cli.config import get_hermes_home
+                ctx_path = get_hermes_home() / "inkbox_call_contexts" / f"{ctx_token}.json"
+                if ctx_path.exists():
+                    call_context = json.loads(ctx_path.read_text())
+                    with suppress(Exception):
+                        ctx_path.unlink()
+                else:
+                    logger.warning(
+                        "[Inkbox:realtime] context_token %s not found at %s",
+                        ctx_token,
+                        ctx_path,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[Inkbox:realtime] Failed to load context_token %s: %s",
+                    ctx_token,
+                    exc,
+                )
+
+        identity = None
+        if self._inkbox is not None:
+            try:
+                identity = await asyncio.to_thread(
+                    self._inkbox.get_identity,
+                    self._identity_handle,
+                )
+                pn_id = getattr(getattr(identity, "phone_number", None), "id", None)
+                if call_id and pn_id:
+                    call = await asyncio.to_thread(self._inkbox._calls.get, pn_id, call_id)
+                    direction = (getattr(call, "direction", "") or direction).strip().lower()
+                    remote_phone_number = (
+                        getattr(call, "remote_phone_number", "") or remote_phone_number
+                    ).strip()
+            except Exception as exc:
+                logger.warning(
+                    "[Inkbox:realtime] Call lookup failed for call_id=%s: %s",
+                    call_id or "unknown",
+                    exc,
+                )
+
+        model = os.getenv("INKBOX_OPENAI_REALTIME_MODEL", "gpt-realtime-2").strip() or "gpt-realtime-2"
+        voice = os.getenv("INKBOX_OPENAI_REALTIME_VOICE_NAME", "marin").strip() or "marin"
+        instructions = os.getenv("INKBOX_OPENAI_REALTIME_INSTRUCTIONS", "").strip() or (
+            "You are Mark's Family Steward voice prototype. Keep normal responses brief, "
+            "natural, and fast. This call is only for testing voice latency. "
+            "If Mark asks for a benign voice diagnostic, such as reciting the Pledge of "
+            "Allegiance, counting, spelling the alphabet, or speaking for a short duration, "
+            "perform the diagnostic directly and then stop. When confirming a number, say "
+            "exactly 'Got it: <number>.' and stop; do not add filler like 'I can capture that.' "
+            "Do not claim you can book, call, pay, schedule, or message anyone. If asked "
+            "to take an external action, say you can capture the request for later approval."
+        )
+        reason = (call_context.get("reason") or "").strip()
+        prior = (call_context.get("conversation_summary") or "").strip()
+        if reason or prior:
+            context_lines = [
+                "This call has explicit context from the text thread. Use it naturally, "
+                "but keep speech concise.",
+            ]
+            if reason:
+                context_lines.append(f"Call reason: {reason}")
+            if prior:
+                context_lines.append(f"Prior context: {prior}")
+            instructions = instructions + "\n\n" + "\n".join(context_lines)
+        realtime_url = f"wss://api.openai.com/v1/realtime?model={model}"
+
+        ws = web.WebSocketResponse()
+        ws.headers["x-use-inkbox-text-to-speech"] = "false"
+        ws.headers["x-use-inkbox-speech-to-text"] = "false"
+        await ws.prepare(request)
+
+        logger.warning(
+            "[Inkbox:realtime] Call WS open: call_id=%s model=%s voice=%s",
+            call_id or "unknown",
+            model,
+            voice,
+        )
+        seen_inkbox_audio = False
+        seen_openai_audio = False
+        sent_inkbox_audio = False
+        inkbox_stream_id: Optional[str] = None
+        pending_opening_line: Optional[str] = None
+        call_transcript: list[tuple[str, str]] = []
+        summary_sent = False
+        outbound_audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+        try:
+            PCMU_CHUNK_BYTES = int(os.getenv("INKBOX_OPENAI_REALTIME_CHUNK_BYTES", "3200"))
+        except ValueError:
+            PCMU_CHUNK_BYTES = 3200
+        PCMU_CHUNK_BYTES = max(160, min(8000, PCMU_CHUNK_BYTES))
+        PCMU_BYTES_PER_SECOND = 8000  # 8 kHz u-law is one byte per sample.
+        realtime_barge_in = _truthy(os.getenv("INKBOX_OPENAI_REALTIME_BARGE_IN", "false"))
+        try:
+            output_audio_speed = float(os.getenv("INKBOX_OPENAI_REALTIME_VOICE_SPEED", "1.0"))
+        except ValueError:
+            output_audio_speed = 1.0
+        output_audio_speed = max(0.75, min(1.5, output_audio_speed))
+        try:
+            tail_silence_ms = int(os.getenv("INKBOX_OPENAI_REALTIME_TAIL_SILENCE_MS", "1200"))
+        except ValueError:
+            tail_silence_ms = 1200
+        tail_silence_ms = max(0, min(3000, tail_silence_ms))
+
+        def _normalize_summary_phone(value: Any) -> str:
+            raw = str(value or "").strip()
+            if raw.startswith("+"):
+                return raw
+            digits = "".join(ch for ch in raw if ch.isdigit())
+            if len(digits) == 11 and digits.startswith("1"):
+                return f"+{digits}"
+            if len(digits) == 10:
+                return f"+1{digits}"
+            return ""
+
+        def _summary_recipient_phone() -> str:
+            explicit = _normalize_summary_phone(
+                call_context.get("summary_to_phone")
+                or call_context.get("requester_phone")
+                or call_context.get("origin_phone")
+                or ""
+            )
+            if explicit:
+                return explicit
+            remote_summary_phone = _normalize_summary_phone(remote_phone_number)
+            recipient = str(call_context.get("summary_recipient") or "").strip().lower()
+            if recipient in {"callee", "remote", "self"} and remote_summary_phone:
+                return remote_summary_phone
+            reason_l = str(call_context.get("reason") or "").lower()
+            # Legacy self-call contexts usually say the user asked to be called back.
+            if (
+                direction == "outbound"
+                and remote_summary_phone
+                and ("call me" in reason_l or "called back" in reason_l or "call back" in reason_l)
+            ):
+                return remote_summary_phone
+            # Mark-only prototype fallback: an outbound Realtime call with an
+            # explicit context should report back to the callee when no better
+            # originating SMS metadata was supplied.
+            if direction == "outbound" and remote_summary_phone and call_context:
+                return remote_summary_phone
+            return ""
+
+        def _format_realtime_transcript_for_handoff() -> str:
+            if not call_transcript:
+                return "[no final transcript turns captured]"
+            lines: list[str] = []
+            for role, utterance in call_transcript:
+                clean = re.sub(r"\s+", " ", str(utterance or "")).strip()
+                if not clean:
+                    continue
+                speaker = "Caller" if role == "caller" else "Voice agent"
+                lines.append(f"{speaker}: {clean}")
+            return "\n".join(lines) if lines else "[no final transcript turns captured]"
+
+        def _post_call_handoff_text() -> str:
+            reason_txt = re.sub(r"\s+", " ", str(call_context.get("reason") or "")).strip()
+            prior_txt = re.sub(r"\s+", " ", str(call_context.get("conversation_summary") or "")).strip()
+            opening_txt = re.sub(r"\s+", " ", str(call_context.get("opening_line") or "")).strip()
+            lines = [
+                "[inkbox:realtime_call_ended_summary_request]",
+                "You are Hermes receiving a completed phone-call handoff from the realtime voice bridge.",
+                "Write exactly one concise SMS back to the user in this thread summarizing what happened.",
+                "Use the transcript below as the source of truth. Preserve exact values that were confirmed during the call, including numbers.",
+                "If the caller gave a value and the voice agent repeated it back and the caller confirmed, report that confirmed value.",
+                "Do not mention internal systems, transcripts, tools, models, or this handoff prompt.",
+                "Do not call, book, pay, schedule, submit, or message any third party. Say no external action was taken unless the transcript proves otherwise.",
+                "Keep the SMS under 500 characters.",
+                "",
+                "Call metadata:",
+                f"- call_id: {call_id or 'unknown'}",
+                f"- direction: {direction or 'unknown'}",
+            ]
+            if reason_txt:
+                lines.append(f"- original request / purpose: {reason_txt}")
+            if prior_txt:
+                lines.append(f"- prior context: {prior_txt}")
+            if opening_txt:
+                lines.append(f"- opening line: {opening_txt}")
+            lines.extend([
+                "",
+                "Call transcript:",
+                _format_realtime_transcript_for_handoff(),
+                "[/inkbox:realtime_call_ended_summary_request]",
+            ])
+            return "\n".join(lines)
+
+        async def _enqueue_post_call_summary_handoff() -> None:
+            nonlocal summary_sent
+            if summary_sent or not _truthy(os.getenv("INKBOX_OPENAI_REALTIME_SUMMARY_SMS", "true")):
+                return
+            summary_sent = True
+            to_phone = _summary_recipient_phone()
+            if not to_phone:
+                logger.warning(
+                    "[Inkbox:realtime] No Hermes post-call summary recipient for call_id=%s direction=%s context=%s",
+                    call_id or "unknown",
+                    direction or "unknown",
+                    "yes" if call_context else "no",
+                )
+                return
+            contact = None
+            with suppress(Exception):
+                contact = await self._resolve_contact_full(kind="phone", value=to_phone)
+            summary_chat_id = contact["id"] if contact else to_phone
+            summary_name = (
+                contact.get("name") if contact and contact.get("name") else to_phone
+            )
+            source = self.build_source(
+                chat_id=str(summary_chat_id),
+                chat_name=summary_name,
+                chat_type="dm",
+                user_id=str(summary_chat_id),
+                user_name=summary_name,
+                user_id_alt=to_phone,
+                message_id=f"call:{call_id or 'unknown'}:postcall-summary",
+            )
+            event = MessageEvent(
+                text=_post_call_handoff_text(),
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message={
+                    "event_type": "realtime.call_ended.summary_request",
+                    "call_id": call_id,
+                    "direction": direction,
+                    "has_context": bool(call_context),
+                    "transcript_turn_count": len(call_transcript),
+                },
+                message_id=f"call:{call_id or 'unknown'}:postcall-summary",
+                auto_skill=None,
+                channel_prompt=(
+                    "This is a post-call SMS summary turn. Do not use tools. "
+                    "Do not take external actions. Reply only with the concise "
+                    "user-facing SMS summary requested in the handoff."
+                ),
+                internal=True,
+            )
+            try:
+                await self._enqueue(event)
+                logger.warning(
+                    "[Inkbox:realtime] Enqueued Hermes post-call summary for %s turns=%d",
+                    redact_phone(to_phone),
+                    len(call_transcript),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Inkbox:realtime] Failed to enqueue Hermes post-call summary for %s: %s",
+                    redact_phone(to_phone),
+                    exc,
+                )
+
+        async def _safe_send_inkbox(payload: Dict[str, Any]) -> None:
+            if not ws.closed:
+                await ws.send_str(json.dumps(payload))
+
+        async def _queue_openai_audio_delta(delta: str) -> None:
+            try:
+                audio_bytes = base64.b64decode(delta)
+            except Exception as exc:
+                logger.warning(
+                    "[Inkbox:realtime] Failed to decode OpenAI audio delta: %s",
+                    exc,
+                )
+                return
+            for offset in range(0, len(audio_bytes), PCMU_CHUNK_BYTES):
+                chunk = audio_bytes[offset:offset + PCMU_CHUNK_BYTES]
+                if chunk:
+                    await outbound_audio_queue.put(chunk)
+
+        async def _queue_tail_silence() -> None:
+            if tail_silence_ms <= 0:
+                return
+            silence_bytes = int(PCMU_BYTES_PER_SECOND * (tail_silence_ms / 1000.0))
+            queued = 0
+            while queued < silence_bytes:
+                chunk_len = min(PCMU_CHUNK_BYTES, silence_bytes - queued)
+                if chunk_len <= 0:
+                    break
+                # PCMU u-law silence is conventionally encoded as 0xff.
+                await outbound_audio_queue.put(b"\xff" * chunk_len)
+                queued += chunk_len
+
+        async def _drain_outbound_audio() -> None:
+            sent_chunks = 0
+            sent_bytes = 0
+            next_send_at = time.monotonic()
+            while True:
+                chunk_bytes = await outbound_audio_queue.get()
+                if chunk_bytes is None:
+                    return
+                payload = base64.b64encode(chunk_bytes).decode("ascii")
+                frame: Dict[str, Any] = {
+                    "event": "media",
+                    "media": {"payload": payload},
+                }
+                if inkbox_stream_id:
+                    frame["stream_id"] = inkbox_stream_id
+                await _safe_send_inkbox(frame)
+                sent_chunks += 1
+                sent_bytes += len(chunk_bytes)
+                if sent_chunks == 1:
+                    logger.warning(
+                        "[Inkbox:realtime] First paced Inkbox media chunk sent stream_id=%s chunk_bytes=%d",
+                        "yes" if inkbox_stream_id else "no",
+                        len(chunk_bytes),
+                    )
+                chunk_seconds = max(len(chunk_bytes) / PCMU_BYTES_PER_SECOND, 0.020)
+                next_send_at += chunk_seconds
+                delay = next_send_at - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                elif sent_chunks % 25 == 0:
+                    logger.warning(
+                        "[Inkbox:realtime] Paced audio sender behind by %.3fs sent_ms=%d queued_chunks=%d",
+                        abs(delay),
+                        int((sent_bytes / PCMU_BYTES_PER_SECOND) * 1000),
+                        outbound_audio_queue.qsize(),
+                    )
+
+        def _extract_audio(payload: Dict[str, Any]) -> Optional[str]:
+            media = payload.get("media")
+            if isinstance(media, dict):
+                value = media.get("payload") or media.get("audio") or media.get("data")
+                if isinstance(value, str) and value:
+                    return value
+            for key in ("audio", "payload", "delta", "data"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    return value
+            return None
+
+        try:
+            async with websockets.connect(
+                realtime_url,
+                additional_headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "OpenAI-Safety-Identifier": "family-steward-mark-voice",
+                },
+                open_timeout=10,
+                max_size=None,
+            ) as openai_ws:
+                await openai_ws.send(json.dumps({
+                    "type": "session.update",
+                    "session": {
+                        "type": "realtime",
+                        "model": model,
+                        "instructions": instructions,
+                        "audio": {
+                            "input": {
+                                "format": {"type": "audio/pcmu"},
+                                "noise_reduction": {"type": "near_field"},
+                                "transcription": {
+                                    "model": "gpt-4o-mini-transcribe",
+                                    "language": "en",
+                                },
+                                "turn_detection": {
+                                    "type": "server_vad",
+                                    "threshold": 0.65,
+                                    "prefix_padding_ms": 250,
+                                    "silence_duration_ms": 650,
+                                    "create_response": False,
+                                    "interrupt_response": realtime_barge_in,
+                                },
+                            },
+                            "output": {
+                                "format": {"type": "audio/pcmu"},
+                                "voice": voice,
+                                "speed": output_audio_speed,
+                            },
+                        },
+                        "output_modalities": ["audio"],
+                        "max_output_tokens": 320,
+                    },
+                }))
+                pending_opening_line = (call_context.get("opening_line") or "").strip()
+                if not pending_opening_line and direction == "outbound" and (reason or prior):
+                    pending_opening_line = "Greet the callee by name if known and briefly state why you are calling."
+                response_in_flight = False
+                pending_response_after_active = False
+
+                async def _create_realtime_response(instructions_override: Optional[str] = None) -> None:
+                    nonlocal response_in_flight, pending_response_after_active
+                    if response_in_flight:
+                        pending_response_after_active = True
+                        logger.warning(
+                            "[Inkbox:realtime] Deferred response.create while active queued_chunks=%d",
+                            outbound_audio_queue.qsize(),
+                        )
+                        return
+                    response: Dict[str, Any] = {"output_modalities": ["audio"]}
+                    if instructions_override:
+                        response["instructions"] = instructions_override
+                    await openai_ws.send(json.dumps({
+                        "type": "response.create",
+                        "response": response,
+                    }))
+                    response_in_flight = True
+
+                async def _send_pending_opening() -> None:
+                    nonlocal pending_opening_line
+                    if not pending_opening_line:
+                        return
+                    line = pending_opening_line
+                    pending_opening_line = None
+                    await _create_realtime_response(line)
+
+                async def inkbox_to_openai() -> None:
+                    async for msg in ws:
+                        if msg.type != WSMsgType.TEXT:
+                            continue
+                        try:
+                            payload = json.loads(msg.data)
+                        except json.JSONDecodeError:
+                            continue
+                        event = str(payload.get("event") or payload.get("type") or "")
+                        nonlocal inkbox_stream_id
+                        stream_id = payload.get("stream_id") or payload.get("streamId")
+                        if stream_id and not inkbox_stream_id:
+                            inkbox_stream_id = str(stream_id)
+                            logger.warning(
+                                "[Inkbox:realtime] Captured Inkbox stream_id for call_id=%s",
+                                call_id or "unknown",
+                            )
+                            await _send_pending_opening()
+                        if event == "stop":
+                            await _enqueue_post_call_summary_handoff()
+                            with suppress(Exception):
+                                await openai_ws.close()
+                            break
+                        audio = _extract_audio(payload)
+                        if audio:
+                            nonlocal seen_inkbox_audio
+                            if not seen_inkbox_audio:
+                                seen_inkbox_audio = True
+                                logger.warning(
+                                    "[Inkbox:realtime] First caller audio frame event=%s keys=%s stream_id=%s",
+                                    event or "unknown",
+                                    sorted(str(k) for k in payload.keys()),
+                                    "yes" if inkbox_stream_id else "no",
+                                )
+                            await openai_ws.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": audio,
+                            }))
+
+                async def openai_to_inkbox() -> None:
+                    nonlocal response_in_flight, pending_response_after_active
+                    async for raw in openai_ws:
+                        try:
+                            event = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        typ = str(event.get("type") or "")
+                        if typ == "error":
+                            err = event.get("error") or {}
+                            logger.warning(
+                                "[Inkbox:realtime] OpenAI error type=%s code=%s message=%s",
+                                err.get("type") or "",
+                                err.get("code") or "",
+                                err.get("message") or "",
+                            )
+                            continue
+                        if typ in {"response.output_audio.delta", "response.audio.delta"}:
+                            delta = event.get("delta")
+                            if isinstance(delta, str) and delta:
+                                nonlocal seen_openai_audio, sent_inkbox_audio
+                                if not seen_openai_audio:
+                                    seen_openai_audio = True
+                                    logger.warning(
+                                        "[Inkbox:realtime] First OpenAI audio delta type=%s chars=%s",
+                                        typ,
+                                        len(delta),
+                                    )
+                                await _queue_openai_audio_delta(delta)
+                                if not sent_inkbox_audio:
+                                    sent_inkbox_audio = True
+                                    logger.warning(
+                                        "[Inkbox:realtime] First OpenAI audio delta queued for paced playback stream_id=%s",
+                                        "yes" if inkbox_stream_id else "no",
+                                    )
+                            continue
+                        if typ == "conversation.item.input_audio_transcription.completed":
+                            transcript = (event.get("transcript") or event.get("text") or "").strip()
+                            if transcript:
+                                call_transcript.append(("caller", transcript))
+                                await _safe_send_inkbox({
+                                    "event": "transcript",
+                                    "text": transcript,
+                                    "is_final": True,
+                                })
+                                await _create_realtime_response()
+                            continue
+                        if typ in {
+                            "response.output_audio_transcript.done",
+                            "response.audio_transcript.done",
+                        }:
+                            transcript = (event.get("transcript") or event.get("text") or "").strip()
+                            if transcript:
+                                call_transcript.append(("assistant", transcript))
+                                await _safe_send_inkbox({
+                                    "event": "transcript",
+                                    "text": transcript,
+                                    "is_final": True,
+                                })
+                            continue
+                        if typ in {"response.done"}:
+                            response = event.get("response") if isinstance(event.get("response"), dict) else {}
+                            status = str(response.get("status") or event.get("status") or "unknown")
+                            response_in_flight = False
+                            await _queue_tail_silence()
+                            logger.warning(
+                                "[Inkbox:realtime] Response done status=%s pending_after_active=%s queued_chunks=%d tail_silence_ms=%d",
+                                status,
+                                "yes" if pending_response_after_active else "no",
+                                outbound_audio_queue.qsize(),
+                                tail_silence_ms,
+                            )
+                            if pending_response_after_active:
+                                pending_response_after_active = False
+                                await _create_realtime_response()
+                            continue
+                        if typ in {"input_audio_buffer.speech_started"}:
+                            logger.warning(
+                                "[Inkbox:realtime] Caller speech_started barge_in=%s queued_chunks=%d in_flight=%s",
+                                "yes" if realtime_barge_in else "no",
+                                outbound_audio_queue.qsize(),
+                                "yes" if response_in_flight else "no",
+                            )
+                            if not realtime_barge_in:
+                                continue
+                            # Drop any queued assistant audio before asking Inkbox to clear
+                            # playback, otherwise the drain task can re-fill the buffer after
+                            # barge-in.
+                            while True:
+                                try:
+                                    outbound_audio_queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+                            clear_frame = {"event": "clear"}
+                            if inkbox_stream_id:
+                                clear_frame["stream_id"] = inkbox_stream_id
+                            await _safe_send_inkbox(clear_frame)
+
+                tasks = [
+                    asyncio.create_task(inkbox_to_openai()),
+                    asyncio.create_task(openai_to_inkbox()),
+                    asyncio.create_task(_drain_outbound_audio()),
+                ]
+                done, pending = await asyncio.wait(tasks[:2], return_when=asyncio.FIRST_COMPLETED)
+                await outbound_audio_queue.put(None)
+                for task in pending:
+                    task.cancel()
+                for task in pending:
+                    with suppress(asyncio.CancelledError):
+                        await task
+                with suppress(asyncio.CancelledError):
+                    await tasks[2]
+                for task in done:
+                    with suppress(asyncio.CancelledError):
+                        exc = task.exception()
+                        if exc:
+                            raise exc
+        except Exception as exc:
+            logger.warning("[Inkbox:realtime] Bridge failed for call_id=%s: %s", call_id, exc)
+        finally:
+            with suppress(Exception):
+                await _enqueue_post_call_summary_handoff()
+            with suppress(Exception):
+                await ws.close()
+            logger.warning("[Inkbox:realtime] Call WS closed: call_id=%s", call_id or "unknown")
+        return ws
+
     async def _handle_call_ws(self, request: "web.Request") -> "web.WebSocketResponse":
         # Verify the HMAC on the upgrade BEFORE prepare(). The public tunnel
         # URL is reachable by anyone on the internet — the tunnel's TLS
@@ -1859,6 +2468,9 @@ class InkboxAdapter(BasePlatformAdapter):
             )
             if not ok:
                 return web.Response(status=401, text="invalid signature")
+
+        if _truthy(os.getenv("INKBOX_OPENAI_REALTIME_VOICE")):
+            return await self._handle_call_ws_openai_realtime(request)
 
         # ``WebSocketResponse`` doesn't take ``headers=`` as a constructor kwarg;
         # we mutate ``ws.headers`` before ``prepare()`` instead, which is what
