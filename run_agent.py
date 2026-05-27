@@ -7166,7 +7166,7 @@ class AIAgent:
                     # but get_final_response() can return an empty output list.
                     # Backfill from collected items or synthesize from deltas.
                     _out = getattr(final_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    if _out is None or (isinstance(_out, list) and not _out):
                         if collected_output_items:
                             final_response.output = list(collected_output_items)
                             logger.debug(
@@ -7250,6 +7250,46 @@ class AIAgent:
                     )
                     return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 raise
+            except TypeError as exc:
+                err_text = str(exc)
+                # OpenAI SDK 2.24 can raise while parsing a valid Codex stream
+                # whose final response.completed payload has output=null. The
+                # useful content was already delivered via output item/text
+                # events, so recover from the events we collected.
+                if "'NoneType' object is not iterable" in err_text:
+                    if collected_output_items:
+                        logger.debug(
+                            "Codex stream parser saw output=null; returning %d collected output items. %s",
+                            len(collected_output_items),
+                            self._client_log_context(),
+                        )
+                        return SimpleNamespace(
+                            status="completed",
+                            output=list(collected_output_items),
+                        )
+                    if self._codex_streamed_text_parts and not has_tool_calls:
+                        assembled = "".join(self._codex_streamed_text_parts)
+                        logger.debug(
+                            "Codex stream parser saw output=null; synthesized output from %d text deltas (%d chars). %s",
+                            len(self._codex_streamed_text_parts),
+                            len(assembled),
+                            self._client_log_context(),
+                        )
+                        return SimpleNamespace(
+                            status="completed",
+                            output=[SimpleNamespace(
+                                type="message",
+                                role="assistant",
+                                status="completed",
+                                content=[SimpleNamespace(type="output_text", text=assembled)],
+                            )],
+                        )
+                    logger.debug(
+                        "Codex stream parser saw output=null with no collected items; falling back to create(stream=True). %s",
+                        self._client_log_context(),
+                    )
+                    return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                raise
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Fallback path for stream completion edge cases on Codex-style Responses backends."""
@@ -7326,7 +7366,7 @@ class AIAgent:
                 if terminal_response is not None:
                     # Backfill empty output from collected stream events
                     _out = getattr(terminal_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    if _out is None or (isinstance(_out, list) and not _out):
                         if collected_output_items:
                             terminal_response.output = list(collected_output_items)
                             logger.debug(

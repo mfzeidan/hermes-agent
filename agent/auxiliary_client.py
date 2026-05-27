@@ -775,31 +775,70 @@ class _CodexCompletionsAdapter:
             collected_output_items: List[Any] = []
             collected_text_deltas: List[str] = []
             has_function_calls = False
+
+            def _final_from_collected_stream(reason: str) -> Any | None:
+                # OpenAI SDK 2.24 can raise while parsing a valid Codex stream
+                # whose terminal response.completed payload has output=null.
+                # The useful content has already arrived in streamed events.
+                if collected_output_items:
+                    logger.debug(
+                        "Codex auxiliary: %s; returning %d collected output items",
+                        reason,
+                        len(collected_output_items),
+                    )
+                    return SimpleNamespace(
+                        status="completed",
+                        output=list(collected_output_items),
+                    )
+                if collected_text_deltas and not has_function_calls:
+                    assembled = "".join(collected_text_deltas)
+                    logger.debug(
+                        "Codex auxiliary: %s; synthesized from %d deltas (%d chars)",
+                        reason,
+                        len(collected_text_deltas),
+                        len(assembled),
+                    )
+                    return SimpleNamespace(
+                        status="completed",
+                        output=[SimpleNamespace(
+                            type="message", role="assistant", status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )],
+                    )
+                return None
+
             if total_timeout:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
-            with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
+            try:
+                with self._client.responses.stream(**resp_kwargs) as stream:
+                    for _event in stream:
+                        _check_cancelled()
+                        _etype = getattr(_event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(_event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(_event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
                     _check_cancelled()
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                _check_cancelled()
-                final = stream.get_final_response()
+                    final = stream.get_final_response()
+            except TypeError as exc:
+                if "'NoneType' object is not iterable" not in str(exc):
+                    raise
+                final = _final_from_collected_stream("stream parser saw output=null")
+                if final is None:
+                    raise
 
             # Backfill empty output from collected stream events
             _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
+            if _output is None or (isinstance(_output, list) and not _output):
                 if collected_output_items:
                     final.output = list(collected_output_items)
                     logger.debug(
@@ -819,6 +858,8 @@ class _CodexCompletionsAdapter:
                         "Codex auxiliary: synthesized from %d deltas (%d chars)",
                         len(collected_text_deltas), len(assembled),
                     )
+                elif _output is None:
+                    final.output = []
 
             # Extract text and tool calls from the Responses output.
             # Items may be SDK objects (attrs) or dicts (raw/fallback paths),
