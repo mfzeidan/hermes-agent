@@ -51,6 +51,23 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     lanes so the Telegram adapter can avoid the known-bad partial routes.
     """
     thread_id = getattr(source, "thread_id", None)
+    if _platform_name(getattr(source, "platform", None)) == "inkbox":
+        chat_topic = str(getattr(source, "chat_topic", "") or "")
+        if str(thread_id or "").startswith("call:") or chat_topic == "voice_call":
+            metadata = {"mode": "voice"}
+            if thread_id is not None:
+                metadata["thread_id"] = thread_id
+            return metadata
+        user_id_alt = str(getattr(source, "user_id_alt", "") or "").strip()
+        if user_id_alt.startswith("+"):
+            metadata = {
+                "mode": "sms",
+                "family_steward_sms_reply_to_phone": user_id_alt,
+                "family_steward_sms_reply_chat_id": str(getattr(source, "chat_id", "") or ""),
+            }
+            if thread_id is not None:
+                metadata["thread_id"] = thread_id
+            return metadata
     if thread_id is None:
         return None
     metadata = {"thread_id": thread_id}

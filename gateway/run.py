@@ -7693,6 +7693,8 @@ class GatewayRunner:
         Used by both first-class inbound messages and queued follow-ups so the
         hook remains a true pre-agent gate for every user turn.
         """
+        if bool(getattr(event, "internal", False)):
+            return "continue", context_prompt, None
         if not self._pre_agent_hook_enabled(source, event):
             return "continue", context_prompt, None
         try:
@@ -13279,6 +13281,24 @@ class GatewayRunner:
     ) -> Optional[Dict[str, Any]]:
         """Build the metadata dict platforms need for thread-aware replies."""
         thread_id = getattr(source, "thread_id", None)
+        platform_value = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
+        if str(platform_value or "").lower() == "inkbox":
+            chat_topic = str(getattr(source, "chat_topic", "") or "")
+            if str(thread_id or "").startswith("call:") or chat_topic == "voice_call":
+                metadata: Dict[str, Any] = {"mode": "voice"}
+                if thread_id is not None:
+                    metadata["thread_id"] = thread_id
+                return metadata
+            user_id_alt = str(getattr(source, "user_id_alt", "") or "").strip()
+            if user_id_alt.startswith("+"):
+                metadata: Dict[str, Any] = {
+                    "mode": "sms",
+                    "family_steward_sms_reply_to_phone": user_id_alt,
+                    "family_steward_sms_reply_chat_id": str(getattr(source, "chat_id", "") or ""),
+                }
+                if thread_id is not None:
+                    metadata["thread_id"] = thread_id
+                return metadata
         if thread_id is None:
             return None
         metadata: Dict[str, Any] = {"thread_id": thread_id}
