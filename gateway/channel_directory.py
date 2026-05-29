@@ -73,6 +73,8 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
                 platforms["discord"] = _build_discord(adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = await _build_slack(adapter)
+            elif platform == Platform.BLUEBUBBLES:
+                platforms["bluebubbles"] = _build_bluebubbles(adapter)
         except Exception as e:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
@@ -206,6 +208,82 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
             seen_ids.add(entry.get("id"))
 
     return channels
+
+
+def _first_profile_value(profile: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = profile.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _bluebubbles_contact_id(profile: Dict[str, Any]) -> str:
+    contact_id = _first_profile_value(
+        profile,
+        "handle",
+        "chat_id",
+        "address",
+        "phone",
+        "email",
+        "user_id",
+    )
+    if contact_id:
+        return contact_id
+    handles = profile.get("handles") or profile.get("aliases") or []
+    if isinstance(handles, str):
+        return handles.strip()
+    if isinstance(handles, list):
+        for handle in handles:
+            value = str(handle).strip()
+            if value:
+                return value
+    return ""
+
+
+def _bluebubbles_contact_name(profile: Dict[str, Any], fallback: str) -> str:
+    return _first_profile_value(
+        profile,
+        "display_name",
+        "name",
+        "first_name",
+    ) or fallback
+
+
+def _build_bluebubbles(adapter) -> List[Dict[str, str]]:
+    """Build configured BlueBubbles contacts plus discovered sessions.
+
+    BlueBubbles cannot safely enumerate every iMessage chat for the model, but
+    explicitly configured contact profiles are intended send targets.
+    """
+    entries: List[Dict[str, str]] = []
+    seen_ids: set[str] = set()
+
+    profiles = getattr(adapter, "contact_profiles", None) or {}
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        entry_id = _bluebubbles_contact_id(profile)
+        if not entry_id or entry_id in seen_ids:
+            continue
+        seen_ids.add(entry_id)
+        entry: Dict[str, str] = {
+            "id": entry_id,
+            "name": _bluebubbles_contact_name(profile, entry_id),
+            "type": "dm",
+        }
+        role = _first_profile_value(profile, "role")
+        if role:
+            entry["role"] = role
+        entries.append(entry)
+
+    for entry in _build_from_sessions("bluebubbles"):
+        entry_id = entry.get("id")
+        if entry_id and entry_id not in seen_ids:
+            entries.append(entry)
+            seen_ids.add(entry_id)
+
+    return entries
 
 
 def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:

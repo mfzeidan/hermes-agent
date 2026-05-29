@@ -14,6 +14,7 @@ from gateway.channel_directory import (
     format_directory_for_display,
     load_directory,
     _build_from_sessions,
+    _build_bluebubbles,
     _build_slack,
     DIRECTORY_PATH,
 )
@@ -266,6 +267,61 @@ class TestBuildFromSessions:
         assert "Coaching Chat" in names
         assert "Coaching Chat / topic 17585" in names
         assert "Coaching Chat / topic 17587" in names
+
+
+class TestBuildBlueBubbles:
+    def test_configured_contacts_are_send_targets(self, tmp_path):
+        adapter = SimpleNamespace(
+            contact_profiles={
+                "+15550100001": {
+                    "display_name": "Mark",
+                    "handle": "iMessage;-;+15550100001",
+                    "role": "operator",
+                },
+                "+15550100002": {
+                    "display_name": "Jessica",
+                    "handle": "iMessage;-;+15550100002",
+                    "role": "household_user",
+                },
+            }
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            entries = _build_bluebubbles(adapter)
+
+        assert {
+            (entry["name"], entry["id"], entry["type"]) for entry in entries
+        } == {
+            ("Mark", "iMessage;-;+15550100001", "dm"),
+            ("Jessica", "iMessage;-;+15550100002", "dm"),
+        }
+
+    def test_configured_contacts_merge_with_sessions(self, tmp_path):
+        sessions_path = tmp_path / "sessions" / "sessions.json"
+        sessions_path.parent.mkdir(parents=True)
+        sessions_path.write_text(json.dumps({
+            "s1": {
+                "origin": {
+                    "platform": "bluebubbles",
+                    "chat_id": "iMessage;-;+15550100003",
+                    "chat_name": "Household",
+                },
+                "chat_type": "dm",
+            }
+        }))
+        adapter = SimpleNamespace(
+            contact_profiles={
+                "+15550100001": {
+                    "display_name": "Mark",
+                    "handle": "iMessage;-;+15550100001",
+                },
+            }
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            entries = _build_bluebubbles(adapter)
+
+        assert {entry["name"] for entry in entries} == {"Mark", "Household"}
 
 
 class TestFormatDirectoryForDisplay:

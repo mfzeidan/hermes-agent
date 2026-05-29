@@ -2722,6 +2722,15 @@ class GatewayRunner:
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
+        platform_value = getattr(event.source.platform, "value", event.source.platform)
+        if platform_value == "bluebubbles":
+            logger.info(
+                "suppressed BlueBubbles busy ack for session %s (mode=%s)",
+                session_key,
+                effective_mode,
+            )
+            return True
+
         # Debounce: only send an acknowledgment once every 30 seconds per session
         # to avoid spamming the user when they send multiple messages quickly
         _BUSY_ACK_COOLDOWN = 30
@@ -15842,6 +15851,24 @@ class GatewayRunner:
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
+            _platform_value = getattr(source.platform, "value", source.platform)
+            if _platform_value == "bluebubbles" and event_type == "lifecycle":
+                _status_text = str(message or "")
+                _suppressed_lifecycle_markers = (
+                    "Compacting context",
+                    "Preflight compression",
+                    "Context reduced to",
+                    "Context too large",
+                    "Compressed ",
+                    "Rate limited. Waiting ",
+                    "Retrying in ",
+                    "API call failed",
+                    "Empty/malformed response",
+                    "Retrying API call",
+                )
+                if any(marker in _status_text for marker in _suppressed_lifecycle_markers):
+                    logger.info("suppressed BlueBubbles lifecycle status: %s", _status_text)
+                    return
             _fut = safe_schedule_threadsafe(
                 _status_adapter.send(
                     _status_chat_id,
@@ -16856,24 +16883,10 @@ class GatewayRunner:
                     _notify_metadata = dict(_status_thread_metadata or {})
                     _notify_metadata["mode"] = "sms"
                 else:
-                    # Include agent activity context if available.
-                    _agent_ref = agent_holder[0]
-                    _status_detail = ""
-                    if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
-                        try:
-                            _a = _agent_ref.get_activity_summary()
-                            _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
-                            if _a.get("current_tool"):
-                                _parts.append(f"running: {_a['current_tool']}")
-                            else:
-                                _parts.append(_a.get("last_activity_desc", ""))
-                            _status_detail = " — " + ", ".join(_parts)
-                        except Exception:
-                            pass
-                    _notify_text = (
-                        f"⏳ Still working... "
-                        f"({_elapsed_mins} min elapsed{_status_detail})"
-                    )
+                    # Keep messaging proof-of-life notices human-readable; do
+                    # not expose tool names, iteration counts, or elapsed-time
+                    # internals in BlueBubbles/iMessage chats.
+                    _notify_text = "Still working on this; I will reply when I am done."
                     _notify_metadata = _status_thread_metadata
                 try:
                     _notify_res = await _notify_adapter.send(
@@ -16890,6 +16903,8 @@ class GatewayRunner:
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
                 notify_count += 1
+                if not _is_sms_progress_turn:
+                    return
 
         _notify_task = asyncio.create_task(_notify_long_running())
 
@@ -17219,18 +17234,24 @@ class GatewayRunner:
                     )
                     first_response = result.get("final_response", "")
                     if first_response and not _already_streamed:
-                        try:
+                        if source.platform == Platform.BLUEBUBBLES:
                             logger.info(
-                                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                                "Queued follow-up for session %s: suppressing unconfirmed first-response resend for BlueBubbles.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
-                                metadata=_status_thread_metadata,
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to send first response before queued message: %s", e)
+                        else:
+                            try:
+                                logger.info(
+                                    "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                                    session_key or "?",
+                                )
+                                await adapter.send(
+                                    source.chat_id,
+                                    first_response,
+                                    metadata=_status_thread_metadata,
+                                )
+                            except Exception as e:
+                                logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
                         logger.info(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",

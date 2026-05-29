@@ -78,7 +78,7 @@ class TestBlueBubblesHelpers:
         assert all("(" not in chunk for chunk in chunks)
 
     @pytest.mark.asyncio
-    async def test_send_splits_paragraphs_into_multiple_bubbles(self, monkeypatch):
+    async def test_send_keeps_paragraphs_in_one_bubble_when_under_limit(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         sent = []
 
@@ -95,7 +95,42 @@ class TestBlueBubblesHelpers:
         result = await adapter.send("user@example.com", "first thought\n\nsecond thought")
 
         assert result.success is True
-        assert sent == ["first thought", "second thought"]
+        assert sent == ["first thought\n\nsecond thought"]
+
+    def test_bluebubbles_followups_queue_instead_of_interrupt(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.busy_followup_policy(None) == {"mode": "queue", "merge_text": True}
+
+    def test_contact_profiles_resolve_sender_display_name(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            contact_profiles={
+                "+15551234567": {
+                    "display_name": "Jessica",
+                    "handles": ["iMessage;-;+15551234567"],
+                }
+            },
+        )
+        profile = adapter._contact_profile_for("iMessage;-;+15551234567")
+        assert adapter._contact_display_name(profile) == "Jessica"
+
+    def test_internal_debug_outbound_content_is_suppressed(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        content = (
+            "Tool terminal returned error: {\"exit_code\": 1}\n"
+            "gateway.run: response ready\n"
+            "/Users/example/source/hermes-agent"
+        )
+        safe = adapter._safe_outbound_content(content)
+        assert "internal tool/log output" in safe
+        assert "Tool terminal" not in safe
+
+    def test_redact_hides_webhook_query_secret(self, monkeypatch):
+        from gateway.platforms.bluebubbles import _redact
+
+        redacted = _redact("http://127.0.0.1:8646/hook?password=secret123")
+        assert "secret123" not in redacted
+        assert "password=[REDACTED]" in redacted
 
     def test_format_message_strips_markdown(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
@@ -418,19 +453,27 @@ class TestBlueBubblesAttachmentDownload:
 
 
 class TestBlueBubblesWebhookUrl:
-    """_webhook_url property normalises local hosts to 'localhost'."""
+    """_webhook_url normalizes wildcard hosts and preserves explicit loopback."""
 
     def test_default_host(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
-        # Default webhook_host is 0.0.0.0 → normalized to localhost
-        assert "localhost" in adapter._webhook_url
+        # Default webhook_host is explicit loopback for local-only BlueBubbles.
+        assert "127.0.0.1" in adapter._webhook_url
         assert str(adapter.webhook_port) in adapter._webhook_url
         assert adapter.webhook_path in adapter._webhook_url
 
-    @pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.1", "localhost", "::"])
-    def test_local_hosts_normalized(self, monkeypatch, host):
+    @pytest.mark.parametrize(
+        "host,expected",
+        [
+            ("0.0.0.0", "localhost"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("localhost", "localhost"),
+            ("::", "localhost"),
+        ],
+    )
+    def test_local_hosts_normalized(self, monkeypatch, host, expected):
         adapter = _make_adapter(monkeypatch, webhook_host=host)
-        assert adapter._webhook_url.startswith("http://localhost:")
+        assert adapter._webhook_url.startswith(f"http://{expected}:")
 
     def test_custom_host_preserved(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, webhook_host="192.168.1.50")

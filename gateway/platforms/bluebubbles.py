@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -42,6 +43,23 @@ DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 DEFAULT_WEBHOOK_PORT = 8645
 DEFAULT_WEBHOOK_PATH = "/bluebubbles-webhook"
 MAX_TEXT_LENGTH = 4000
+INTERNAL_DEBUG_FALLBACK = (
+    "I hit an internal tool/log output issue there, so I am not going to paste "
+    "the debug text into iMessage. Send the household request again and I will "
+    "answer briefly."
+)
+INTERNAL_DEBUG_MARKERS = (
+    "run_agent:",
+    "gateway.run:",
+    "gateway.platforms.",
+    "tool terminal returned error",
+    "tool terminal completed",
+    "traceback (most recent call last)",
+    '"exit_code":',
+    '"stderr":',
+    "hermes_session_",
+    "/users/",
+)
 
 # Tapback reaction codes (BlueBubbles associatedMessageType values)
 _TAPBACK_ADDED = {
@@ -59,10 +77,12 @@ _MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
 # Log redaction patterns
 _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_QUERY_SECRET_RE = re.compile(r"([?&](?:password|guid)=)[^&\s\"']+", re.IGNORECASE)
 
 
 def _redact(text: str) -> str:
     """Redact phone numbers and emails from log output."""
+    text = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
     text = _PHONE_RE.sub("[REDACTED]", text)
     text = _EMAIL_RE.sub("[REDACTED]", text)
     return text
@@ -124,11 +144,21 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not str(self.webhook_path).startswith("/"):
             self.webhook_path = f"/{self.webhook_path}"
         self.send_read_receipts = bool(extra.get("send_read_receipts", True))
+        auto_skill = extra.get("auto_skill")
+        if isinstance(auto_skill, str):
+            auto_skill = auto_skill.strip() or None
+        elif isinstance(auto_skill, list):
+            auto_skill = [str(item).strip() for item in auto_skill if str(item).strip()]
+        else:
+            auto_skill = None
+        self.auto_skill = auto_skill
+        self.contact_profiles = self._load_contact_profiles(extra)
         self.client: Optional[httpx.AsyncClient] = None
         self._runner = None
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: Dict[str, str] = {}
+        self._recent_inbound: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # API helpers
@@ -179,7 +209,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.error(
-                "[bluebubbles] cannot reach server at %s: %s", self.server_url, exc
+                "[bluebubbles] cannot reach server at %s: %s", self.server_url, _redact(str(exc))
             )
             if self.client:
                 await self.client.aclose()
@@ -189,7 +219,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         app = web.Application()
         app.router.add_get("/health", lambda _: web.Response(text="ok"))
         app.router.add_post(self.webhook_path, self._handle_webhook)
-        self._runner = web.AppRunner(app)
+        # The registered webhook URL includes the BlueBubbles password as a
+        # query parameter. Disable aiohttp access logs for this local listener
+        # so future webhook POSTs do not persist that secret in gateway logs.
+        self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.webhook_host, self.webhook_port)
         await site.start()
@@ -223,7 +256,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     def _webhook_url(self) -> str:
         """Compute the external webhook URL for BlueBubbles registration."""
         host = self.webhook_host
-        if host in {"0.0.0.0", "127.0.0.1", "localhost", "::"}:
+        if host in ("0.0.0.0", "::"):
             host = "localhost"
         return f"http://{host}:{self.webhook_port}{self.webhook_path}"
 
@@ -269,7 +302,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         existing = await self._find_registered_webhooks(webhook_url)
         if existing:
             logger.info(
-                "[bluebubbles] webhook already registered: %s", webhook_url
+                "[bluebubbles] webhook already registered: %s", _redact(webhook_url)
             )
             return True
 
@@ -284,7 +317,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             if 200 <= status < 300:
                 logger.info(
                     "[bluebubbles] webhook registered with server: %s",
-                    webhook_url,
+                    _redact(webhook_url),
                 )
                 return True
             else:
@@ -297,7 +330,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning(
                 "[bluebubbles] failed to register webhook with server: %s",
-                exc,
+                _redact(str(exc)),
             )
             return False
 
@@ -324,12 +357,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                     removed = True
             if removed:
                 logger.info(
-                    "[bluebubbles] webhook unregistered: %s", webhook_url
+                    "[bluebubbles] webhook unregistered: %s", _redact(webhook_url)
                 )
         except Exception as exc:
             logger.debug(
                 "[bluebubbles] failed to unregister webhook (non-critical): %s",
-                exc,
+                _redact(str(exc)),
             )
         return removed
 
@@ -408,19 +441,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        text = self.format_message(content)
+        text = self.format_message(self._safe_outbound_content(content))
         if not text:
             return SendResult(success=False, error="BlueBubbles send requires text")
-        # Split on paragraph breaks first (double newlines) so each thought
-        # becomes its own iMessage bubble, then truncate any that are still
-        # too long.
-        paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
-        chunks: List[str] = []
-        for para in (paragraphs or [text]):
-            if len(para) <= self.MAX_MESSAGE_LENGTH:
-                chunks.append(para)
-            else:
-                chunks.extend(self.truncate_message(para, max_length=self.MAX_MESSAGE_LENGTH))
+        # Keep one assistant response in one iMessage bubble when possible.
+        # Split only for hard length limits, not for paragraph breaks.
+        chunks = self.truncate_message(text, max_length=self.MAX_MESSAGE_LENGTH)
         last = SendResult(success=True)
         for chunk in chunks:
             guid = await self._resolve_chat_guid(chat_id)
@@ -453,6 +479,16 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             except Exception as exc:
                 return SendResult(success=False, error=str(exc))
         return last
+
+    def busy_followup_policy(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
+        """Queue iMessage follow-ups instead of interrupting the active turn.
+
+        BlueBubbles can deliver near-simultaneous webhooks while a previous
+        iMessage response is still finalizing. Interrupt mode can replay the
+        same text as a second turn and expose internal state in the reply.
+        Queueing preserves the user text without creating a reentrant turn.
+        """
+        return {"mode": "queue", "merge_text": True}
 
     # ------------------------------------------------------------------
     # Media sending (outbound)
@@ -676,6 +712,99 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         return strip_markdown(content)
 
+    @staticmethod
+    def _normalize_contact_key(value: Any) -> str:
+        token = str(value or "").strip().lower()
+        if not token:
+            return ""
+        if token.startswith("imessage;-;"):
+            token = token.rsplit(";-;", 1)[-1]
+        if token.startswith("imessage:"):
+            token = token.split(":", 1)[-1]
+        if "@" not in token:
+            token = re.sub(r"[\s().-]", "", token)
+        return token
+
+    @classmethod
+    def _load_contact_profiles(cls, extra: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        raw_profiles = (
+            extra.get("contact_profiles")
+            or extra.get("contacts")
+            or extra.get("identity_profiles")
+            or {}
+        )
+        profiles: Dict[str, Dict[str, Any]] = {}
+
+        def register_profile(profile: Dict[str, Any], fallback_handle: Any = "") -> None:
+            handles: List[Any] = []
+            if fallback_handle:
+                handles.append(fallback_handle)
+            for key in ("handle", "address", "phone", "email", "user_id"):
+                if profile.get(key):
+                    handles.append(profile.get(key))
+            extra_handles = profile.get("handles") or profile.get("aliases") or []
+            if isinstance(extra_handles, (str, int)):
+                handles.append(extra_handles)
+            elif isinstance(extra_handles, list):
+                handles.extend(extra_handles)
+            for handle in handles:
+                normalized = cls._normalize_contact_key(handle)
+                if normalized:
+                    profiles[normalized] = profile
+
+        if isinstance(raw_profiles, dict):
+            for handle, value in raw_profiles.items():
+                if isinstance(value, dict):
+                    profile = dict(value)
+                    profile.setdefault("handle", handle)
+                else:
+                    profile = {"display_name": str(value), "handle": handle}
+                register_profile(profile, handle)
+        elif isinstance(raw_profiles, list):
+            for value in raw_profiles:
+                if isinstance(value, dict):
+                    register_profile(dict(value))
+
+        return profiles
+
+    def _contact_profile_for(self, *candidates: Any) -> Dict[str, Any]:
+        for candidate in candidates:
+            normalized = self._normalize_contact_key(candidate)
+            if normalized and normalized in self.contact_profiles:
+                return self.contact_profiles[normalized]
+        return {}
+
+    @staticmethod
+    def _contact_display_name(profile: Dict[str, Any]) -> str:
+        for key in ("display_name", "name", "first_name"):
+            value = profile.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _looks_like_internal_debug_output(content: str) -> bool:
+        text = content or ""
+        lowered = text.lower()
+        marker_count = sum(1 for marker in INTERNAL_DEBUG_MARKERS if marker in lowered)
+        if marker_count >= 2:
+            return True
+        if len(text) > 2500 and marker_count >= 1:
+            return True
+        if len(text) > 2500 and re.search(r"\btool\s+\w+\s+(?:returned error|completed)\b", lowered):
+            return True
+        return False
+
+    def _safe_outbound_content(self, content: str) -> str:
+        text = str(content or "")
+        if self._looks_like_internal_debug_output(text):
+            logger.warning(
+                "[bluebubbles] internal debug-looking outbound response suppressed (%d chars)",
+                len(text),
+            )
+            return INTERNAL_DEBUG_FALLBACK
+        return text
+
     # ------------------------------------------------------------------
     # Inbound attachment downloading (from #4588)
     # ------------------------------------------------------------------
@@ -736,7 +865,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             logger.warning(
                 "[bluebubbles] failed to download attachment %s: %s",
                 _redact(att_guid),
-                exc,
+                _redact(str(exc)),
             )
             return None
 
@@ -764,6 +893,58 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             if isinstance(candidate, str) and candidate.strip():
                 return candidate.strip()
         return None
+
+    @staticmethod
+    def _canonical_dm_chat_id(*candidates: Any) -> Optional[str]:
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            value = candidate.strip()
+            if not value:
+                continue
+            if re.match(r"^\+?\d{7,15}$", value) or "@" in value:
+                return value if value.startswith("iMessage;-;") else f"iMessage;-;{value}"
+        return None
+
+    def _is_duplicate_inbound(self, key: str, *, ttl_seconds: float = 30.0) -> bool:
+        now = time.time()
+        cache_path = os.path.expanduser("~/.hermes/cache/bluebubbles-inbound-dedupe.json")
+
+        if not getattr(self, "_recent_inbound_loaded", False):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as fh:
+                    stored = json.load(fh)
+                if isinstance(stored, dict):
+                    for stored_key, seen_at in stored.items():
+                        try:
+                            self._recent_inbound[str(stored_key)] = float(seen_at)
+                        except Exception:
+                            pass
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                logger.debug("[bluebubbles] failed to load inbound dedupe cache: %s", exc)
+            self._recent_inbound_loaded = True
+
+        for old_key, seen_at in list(self._recent_inbound.items()):
+            # BlueBubbles can redeliver old webhook events many minutes later;
+            # stable message-id keys need a longer cache than text fallback keys.
+            old_ttl = 86400.0 if old_key.startswith("id:") else ttl_seconds
+            if now - seen_at > old_ttl:
+                self._recent_inbound.pop(old_key, None)
+        if key in self._recent_inbound:
+            return True
+        self._recent_inbound[key] = now
+
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            tmp_path = f"{cache_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(self._recent_inbound, fh)
+            os.replace(tmp_path, cache_path)
+        except Exception as exc:
+            logger.debug("[bluebubbles] failed to persist inbound dedupe cache: %s", exc)
+        return False
 
     async def _handle_webhook(self, request):
         from aiohttp import web
@@ -898,14 +1079,52 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not sender or not (chat_guid or chat_identifier) or not text:
             return web.json_response({"error": "missing message fields"}, status=400)
 
-        session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
+        if is_group:
+            session_chat_id = chat_guid or chat_identifier
+        else:
+            session_chat_id = (
+                self._canonical_dm_chat_id(chat_guid, chat_identifier, sender)
+                or chat_guid
+                or chat_identifier
+            )
+        contact_profile = self._contact_profile_for(sender, chat_identifier, chat_guid, session_chat_id)
+        display_name = self._contact_display_name(contact_profile) or sender
+        chat_display_name = (
+            self._value(contact_profile.get("chat_name")) if contact_profile else None
+        ) or (chat_identifier or display_name)
+        message_id = self._value(
+            record.get("guid"),
+            record.get("messageGuid"),
+            record.get("id"),
+        )
+        duplicate_key = (
+            f"id:{message_id}"
+            if message_id
+            else f"dm:{session_chat_id}:{sender}:{text}"
+        )
+        content_key = f"content:{session_chat_id}:{sender}:{text}"
+        id_duplicate = self._is_duplicate_inbound(
+            duplicate_key,
+            ttl_seconds=86400.0 if message_id else 1800.0,
+        )
+        content_duplicate = self._is_duplicate_inbound(
+            content_key,
+            ttl_seconds=30.0 if message_id else 1800.0,
+        )
+        if id_duplicate or content_duplicate:
+            logger.info(
+                "[bluebubbles] duplicate inbound message suppressed chat=%s sender=%s",
+                session_chat_id,
+                _redact(sender),
+            )
+            return web.Response(text="ok")
         source = self.build_source(
             chat_id=session_chat_id,
-            chat_name=chat_identifier or sender,
+            chat_name=chat_display_name,
             chat_type="group" if is_group else "dm",
             user_id=sender,
-            user_name=sender,
+            user_name=display_name,
             chat_id_alt=chat_identifier,
         )
         event = MessageEvent(
@@ -913,17 +1132,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=payload,
-            message_id=self._value(
-                record.get("guid"),
-                record.get("messageGuid"),
-                record.get("id"),
-            ),
+            message_id=message_id,
             reply_to_message_id=self._value(
                 record.get("threadOriginatorGuid"),
                 record.get("associatedMessageGuid"),
             ),
             media_urls=media_urls,
             media_types=media_types,
+            auto_skill=self.auto_skill,
         )
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
@@ -934,4 +1150,3 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             asyncio.create_task(self.mark_read(session_chat_id))
 
         return web.Response(text="ok")
-

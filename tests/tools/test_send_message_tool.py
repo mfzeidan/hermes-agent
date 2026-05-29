@@ -182,6 +182,66 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_bluebubbles_contact_name_resolves_to_imessage_target(self, tmp_path):
+        bluebubbles_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.BLUEBUBBLES: bluebubbles_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {
+                "bluebubbles": [
+                    {"id": "iMessage;-;+15550100002", "name": "Jessica", "type": "dm"}
+                ]
+            },
+        }))
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "bluebubbles:Jessica",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.BLUEBUBBLES,
+            bluebubbles_cfg,
+            "iMessage;-;+15550100002",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_bluebubbles_direct_targets_are_explicit(self):
+        assert _parse_target_ref("bluebubbles", "+15550100002") == (
+            "+15550100002",
+            None,
+            True,
+        )
+        assert _parse_target_ref("bluebubbles", "iMessage;-;+15550100002") == (
+            "iMessage;-;+15550100002",
+            None,
+            True,
+        )
+        assert _parse_target_ref("bluebubbles", "imessage:+15550100002") == (
+            "+15550100002",
+            None,
+            True,
+        )
+
     def test_mirror_receives_current_session_user_id(self):
         config, _telegram_cfg = _make_config()
 

@@ -130,7 +130,9 @@ SEND_MESSAGE_SCHEMA = {
         "(not just a bare platform name), call send_message(action='list') FIRST to see "
         "available targets, then send to the correct one.\n"
         "If the user just says a platform name like 'send to telegram', send directly "
-        "to the home channel without listing first."
+        "to the home channel without listing first. BlueBubbles/iMessage targets can "
+        "be resolved by configured contact name, raw iMessage chat GUID, E.164 phone "
+        "number, or email address."
     ),
     "parameters": {
         "type": "object",
@@ -359,6 +361,17 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             # Preserve the leading '+' — signal-cli and sms/whatsapp adapters
             # expect E.164 format for direct recipients.
             return target_ref.strip(), None, True
+    if platform_name == "bluebubbles":
+        stripped = target_ref.strip()
+        lowered = stripped.lower()
+        if ";" in stripped:
+            return stripped, None, True
+        if lowered.startswith(("imessage:", "sms:")):
+            address = stripped.split(":", 1)[1].strip()
+            if address:
+                return address, None, True
+        if _E164_TARGET_RE.fullmatch(stripped) or _EMAIL_TARGET_RE.fullmatch(stripped):
+            return stripped, None, True
     if platform_name == "inkbox":
         # Inkbox accepts a contact UUID, an email address, or an E.164 phone
         # number as a direct send target.  send_inkbox_direct() detects which
@@ -1709,7 +1722,12 @@ async def _send_inkbox(extra, chat_id, message):
 
 
 async def _send_bluebubbles(extra, chat_id, message):
-    """Send via BlueBubbles iMessage server using the adapter's REST API."""
+    """Send via BlueBubbles iMessage server using the adapter's REST API.
+
+    Do not call ``adapter.connect()`` here: that starts/registers a webhook
+    listener and can conflict with the live gateway. Direct sends only need the
+    REST client plus server capability flags.
+    """
     try:
         from gateway.platforms.bluebubbles import BlueBubblesAdapter, check_bluebubbles_requirements
         if not check_bluebubbles_requirements():
@@ -1721,16 +1739,26 @@ async def _send_bluebubbles(extra, chat_id, message):
         from gateway.config import PlatformConfig
         pconfig = PlatformConfig(extra=extra)
         adapter = BlueBubblesAdapter(pconfig)
-        connected = await adapter.connect()
-        if not connected:
-            return _error("BlueBubbles: failed to connect to server")
+        if not adapter.server_url or not adapter.password:
+            return _error("BlueBubbles: server_url and password are required")
+        import httpx
+        from gateway.platforms._http_client_limits import platform_httpx_limits
+
+        adapter.client = httpx.AsyncClient(timeout=30.0, limits=platform_httpx_limits())
         try:
+            await adapter._api_get("/api/v1/ping")
+            info = await adapter._api_get("/api/v1/server/info")
+            server_data = (info or {}).get("data", {})
+            adapter._private_api_enabled = bool(server_data.get("private_api"))
+            adapter._helper_connected = bool(server_data.get("helper_connected"))
             result = await adapter.send(chat_id, message)
             if not result.success:
                 return _error(f"BlueBubbles send failed: {result.error}")
             return {"success": True, "platform": "bluebubbles", "chat_id": chat_id, "message_id": result.message_id}
         finally:
-            await adapter.disconnect()
+            if adapter.client:
+                await adapter.client.aclose()
+                adapter.client = None
     except Exception as e:
         return _error(f"BlueBubbles send failed: {e}")
 
