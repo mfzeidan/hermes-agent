@@ -1,4 +1,6 @@
 """Tests for the BlueBubbles iMessage gateway adapter."""
+from types import SimpleNamespace
+
 import pytest
 
 from gateway.config import Platform, PlatformConfig
@@ -25,6 +27,8 @@ class TestBlueBubblesConfigLoading:
         monkeypatch.setenv("BLUEBUBBLES_SERVER_URL", "http://localhost:1234")
         monkeypatch.setenv("BLUEBUBBLES_PASSWORD", "secret")
         monkeypatch.setenv("BLUEBUBBLES_WEBHOOK_PORT", "9999")
+        monkeypatch.setenv("BLUEBUBBLES_REGISTER_WEBHOOK", "false")
+        monkeypatch.setenv("BLUEBUBBLES_SPLIT_PARAGRAPHS", "false")
         from gateway.config import GatewayConfig, _apply_env_overrides
 
         config = GatewayConfig()
@@ -35,6 +39,8 @@ class TestBlueBubblesConfigLoading:
         assert bc.extra["server_url"] == "http://localhost:1234"
         assert bc.extra["password"] == "secret"
         assert bc.extra["webhook_port"] == 9999
+        assert bc.extra["register_webhook"] is False
+        assert bc.extra["split_paragraphs"] is False
 
     def test_home_channel_set_from_env(self, monkeypatch):
         monkeypatch.setenv("BLUEBUBBLES_SERVER_URL", "http://localhost:1234")
@@ -97,9 +103,67 @@ class TestBlueBubblesHelpers:
         assert result.success is True
         assert sent == ["first thought\n\nsecond thought"]
 
+    @pytest.mark.asyncio
+    async def test_send_can_split_paragraphs_when_explicitly_enabled(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, split_paragraphs=True)
+        sent = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(path, payload):
+            sent.append(payload["message"])
+            return {"data": {"guid": f"msg-{len(sent)}"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("user@example.com", "first thought\n\nsecond thought")
+
+        assert result.success is True
+        assert sent == ["first thought", "second thought"]
+
     def test_bluebubbles_followups_queue_instead_of_interrupt(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         assert adapter.busy_followup_policy(None) == {"mode": "queue", "merge_text": True}
+
+    def test_register_webhook_flag_defaults_on_and_can_be_disabled(self, monkeypatch):
+        assert _make_adapter(monkeypatch).register_webhook is True
+        assert _make_adapter(monkeypatch, register_webhook=False).register_webhook is False
+
+    def test_webhook_port_zero_updates_to_bound_port(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, webhook_port=0)
+        socket = SimpleNamespace(getsockname=lambda: ("127.0.0.1", 48123))
+        site = SimpleNamespace(_server=SimpleNamespace(sockets=[socket]))
+
+        adapter._update_bound_webhook_port(site)
+
+        assert adapter.webhook_port == 48123
+
+    @pytest.mark.asyncio
+    async def test_disconnect_skips_unregister_when_registration_disabled(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, register_webhook=False)
+        called = False
+
+        async def fake_unregister():
+            nonlocal called
+            called = True
+            return True
+
+        monkeypatch.setattr(adapter, "_unregister_webhook", fake_unregister)
+
+        await adapter.disconnect()
+
+        assert called is False
+
+    def test_inbound_dedupe_cache_uses_hermes_home(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / ".hermes-profile"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        adapter = _make_adapter(monkeypatch)
+
+        assert adapter._is_duplicate_inbound("id:message-1") is False
+        assert adapter._is_duplicate_inbound("id:message-1") is True
+        assert (hermes_home / "cache" / "bluebubbles-inbound-dedupe.json").exists()
 
     def test_contact_profiles_resolve_sender_display_name(self, monkeypatch):
         adapter = _make_adapter(

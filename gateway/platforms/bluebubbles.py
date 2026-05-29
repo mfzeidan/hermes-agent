@@ -21,6 +21,7 @@ from urllib.parse import quote
 
 import httpx
 
+from hermes_cli.config import get_hermes_home
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -110,7 +111,29 @@ def _normalize_server_url(raw: str) -> str:
     return value.rstrip("/")
 
 
+def _coerce_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+        return default
+    return bool(value)
 
+
+def _coerce_webhook_port(value: Any) -> int:
+    if value is None or str(value).strip() == "":
+        return DEFAULT_WEBHOOK_PORT
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_WEBHOOK_PORT
+    if port < 0 or port > 65535:
+        return DEFAULT_WEBHOOK_PORT
+    return port
 
 
 # ---------------------------------------------------------------------------
@@ -133,9 +156,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             extra.get("webhook_host")
             or os.getenv("BLUEBUBBLES_WEBHOOK_HOST", DEFAULT_WEBHOOK_HOST)
         )
-        self.webhook_port = int(
+        self.webhook_port = _coerce_webhook_port(
             extra.get("webhook_port")
-            or os.getenv("BLUEBUBBLES_WEBHOOK_PORT", str(DEFAULT_WEBHOOK_PORT))
+            if extra.get("webhook_port") is not None
+            else os.getenv("BLUEBUBBLES_WEBHOOK_PORT", str(DEFAULT_WEBHOOK_PORT))
         )
         self.webhook_path = (
             extra.get("webhook_path")
@@ -144,6 +168,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not str(self.webhook_path).startswith("/"):
             self.webhook_path = f"/{self.webhook_path}"
         self.send_read_receipts = bool(extra.get("send_read_receipts", True))
+        self.register_webhook = _coerce_bool(
+            extra.get("register_webhook", os.getenv("BLUEBUBBLES_REGISTER_WEBHOOK")),
+            default=True,
+        )
+        self.split_paragraphs = _coerce_bool(
+            extra.get("split_paragraphs", os.getenv("BLUEBUBBLES_SPLIT_PARAGRAPHS")),
+            default=False,
+        )
         auto_skill = extra.get("auto_skill")
         if isinstance(auto_skill, str):
             auto_skill = auto_skill.strip() or None
@@ -159,6 +191,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._helper_connected: bool = False
         self._guid_cache: Dict[str, str] = {}
         self._recent_inbound: Dict[str, float] = {}
+        self._recent_inbound_loaded: bool = False
 
     # ------------------------------------------------------------------
     # API helpers
@@ -226,6 +259,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.webhook_host, self.webhook_port)
         await site.start()
+        self._update_bound_webhook_port(site)
         self._mark_connected()
         logger.info(
             "[bluebubbles] webhook listening on http://%s:%s%s",
@@ -234,15 +268,22 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             self.webhook_path,
         )
 
-        # Register webhook with BlueBubbles server
-        # This is required for the server to know where to send events
-        await self._register_webhook()
+        if self.register_webhook:
+            # Register webhook with BlueBubbles server. Shared-router profiles
+            # can set register_webhook=false and still accept locally forwarded
+            # events without stealing the server-wide webhook.
+            await self._register_webhook()
+        else:
+            logger.info("[bluebubbles] webhook registration disabled by config")
 
         return True
 
     async def disconnect(self) -> None:
-        # Unregister webhook before cleaning up
-        await self._unregister_webhook()
+        # Unregister webhook before cleaning up only for profiles that own
+        # BlueBubbles registration. Shared-router profiles must not delete the
+        # router-owned webhook on shutdown.
+        if self.register_webhook:
+            await self._unregister_webhook()
 
         if self.client:
             await self.client.aclose()
@@ -251,6 +292,21 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             await self._runner.cleanup()
             self._runner = None
         self._mark_disconnected()
+
+    def _update_bound_webhook_port(self, site: Any) -> None:
+        """Record the actual bound port when webhook_port=0 is used."""
+        if self.webhook_port != 0:
+            return
+        server = getattr(site, "_server", None)
+        sockets = getattr(server, "sockets", None) or []
+        for socket in sockets:
+            try:
+                sockaddr = socket.getsockname()
+            except Exception:
+                continue
+            if isinstance(sockaddr, tuple) and len(sockaddr) >= 2:
+                self.webhook_port = int(sockaddr[1])
+                return
 
     @property
     def _webhook_url(self) -> str:
@@ -444,9 +500,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         text = self.format_message(self._safe_outbound_content(content))
         if not text:
             return SendResult(success=False, error="BlueBubbles send requires text")
-        # Keep one assistant response in one iMessage bubble when possible.
-        # Split only for hard length limits, not for paragraph breaks.
-        chunks = self.truncate_message(text, max_length=self.MAX_MESSAGE_LENGTH)
+        if self.split_paragraphs:
+            paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+            chunks: List[str] = []
+            for para in (paragraphs or [text]):
+                chunks.extend(self.truncate_message(para, max_length=self.MAX_MESSAGE_LENGTH))
+        else:
+            # Keep one assistant response in one iMessage bubble when possible.
+            # Split only for hard length limits, not for paragraph breaks.
+            chunks = self.truncate_message(text, max_length=self.MAX_MESSAGE_LENGTH)
         last = SendResult(success=True)
         for chunk in chunks:
             guid = await self._resolve_chat_guid(chat_id)
@@ -908,11 +970,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
     def _is_duplicate_inbound(self, key: str, *, ttl_seconds: float = 30.0) -> bool:
         now = time.time()
-        cache_path = os.path.expanduser("~/.hermes/cache/bluebubbles-inbound-dedupe.json")
+        cache_path = get_hermes_home() / "cache" / "bluebubbles-inbound-dedupe.json"
 
         if not getattr(self, "_recent_inbound_loaded", False):
             try:
-                with open(cache_path, "r", encoding="utf-8") as fh:
+                with cache_path.open("r", encoding="utf-8") as fh:
                     stored = json.load(fh)
                 if isinstance(stored, dict):
                     for stored_key, seen_at in stored.items():
@@ -937,9 +999,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._recent_inbound[key] = now
 
         try:
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-            tmp_path = f"{cache_path}.tmp"
-            with open(tmp_path, "w", encoding="utf-8") as fh:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_suffix(f"{cache_path.suffix}.tmp")
+            with tmp_path.open("w", encoding="utf-8") as fh:
                 json.dump(self._recent_inbound, fh)
             os.replace(tmp_path, cache_path)
         except Exception as exc:

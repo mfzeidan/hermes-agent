@@ -1814,6 +1814,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "webhook_port": int(os.getenv("BLUEBUBBLES_WEBHOOK_PORT", "8645")),
             "webhook_path": os.getenv("BLUEBUBBLES_WEBHOOK_PATH", "/bluebubbles-webhook"),
             "send_read_receipts": os.getenv("BLUEBUBBLES_SEND_READ_RECEIPTS", "true").lower() in {"true", "1", "yes"},
+            "register_webhook": _coerce_bool(os.getenv("BLUEBUBBLES_REGISTER_WEBHOOK"), True),
+            "split_paragraphs": _coerce_bool(os.getenv("BLUEBUBBLES_SPLIT_PARAGRAPHS"), False),
         })
     # Inkbox (email + SMS + voice via inkbox.ai)
     inkbox_api_key = os.getenv("INKBOX_API_KEY")
