@@ -4,6 +4,8 @@ stocks_client.py - Stock market data CLI tool for the Hermes Agent project.
 Zero external dependencies - Python stdlib only.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
