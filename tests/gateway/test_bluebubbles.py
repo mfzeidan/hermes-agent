@@ -1,4 +1,8 @@
 """Tests for the BlueBubbles iMessage gateway adapter."""
+import asyncio
+import json
+from unittest.mock import AsyncMock
+
 import pytest
 
 from gateway.config import Platform, PlatformConfig
@@ -18,6 +22,22 @@ def _make_adapter(monkeypatch, **extra):
         },
     )
     return BlueBubblesAdapter(cfg)
+
+
+class _WebhookRequest:
+    query = {"password": "secret"}
+    headers = {}
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
+async def _drain_background_tasks(adapter):
+    if adapter._background_tasks:
+        await asyncio.gather(*list(adapter._background_tasks))
 
 
 class TestBlueBubblesConfigLoading:
@@ -183,6 +203,74 @@ class TestBlueBubblesWebhookParsing:
         if not (chat_guid or chat_identifier) and sender:
             chat_identifier = sender
         assert chat_identifier == "user@example.com"
+
+    @pytest.mark.asyncio
+    async def test_webhook_forwards_tapback_as_visible_message(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+
+        payload = {
+            "type": "updated-message",
+            "data": {
+                "guid": "REACTION-GUID",
+                "associatedMessageType": 2001,
+                "associatedMessageGuid": "ORIGINAL-GUID",
+                "handle": {"address": "user@example.com"},
+                "chats": [
+                    {
+                        "guid": "iMessage;-;user@example.com",
+                        "chatIdentifier": "user@example.com",
+                    }
+                ],
+                "isFromMe": False,
+            },
+        }
+
+        response = await adapter._handle_webhook(_WebhookRequest(payload))
+        assert response.status == 200
+        await _drain_background_tasks(adapter)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "Reacted 👍 to a previous message"
+        assert event.reply_to_message_id == "ORIGINAL-GUID"
+
+    @pytest.mark.asyncio
+    async def test_webhook_dedupes_duplicate_tapback_shapes(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+
+        base_data = {
+            "associatedMessageType": 2001,
+            "associatedMessageGuid": "ORIGINAL-GUID",
+            "handle": {"address": "user@example.com"},
+            "chats": [
+                {
+                    "guid": "iMessage;-;user@example.com",
+                    "chatIdentifier": "user@example.com",
+                }
+            ],
+            "isFromMe": False,
+        }
+        first_payload = {
+            "type": "updated-message",
+            "data": {**base_data, "guid": "REACTION-GUID-1"},
+        }
+        duplicate_payload = {
+            "type": "reaction",
+            "data": {**base_data, "guid": "REACTION-GUID-2"},
+        }
+
+        first_response = await adapter._handle_webhook(_WebhookRequest(first_payload))
+        duplicate_response = await adapter._handle_webhook(_WebhookRequest(duplicate_payload))
+        assert first_response.status == 200
+        assert duplicate_response.status == 200
+        await _drain_background_tasks(adapter)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "Reacted 👍 to a previous message"
+        assert event.message_id == "REACTION-GUID-1"
 
     def test_webhook_extracts_chat_guid_from_chats_array_dm(self, monkeypatch):
         """BB v1.9+ webhook payloads omit top-level chatGuid; GUID is in chats[0].guid."""

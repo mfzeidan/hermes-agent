@@ -30,7 +30,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
 )
-from gateway.platforms.helpers import strip_markdown
+from gateway.platforms.helpers import MessageDeduplicator, strip_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +52,17 @@ _TAPBACK_REMOVED = {
     3000: "love", 3001: "like", 3002: "dislike",
     3003: "laugh", 3004: "emphasize", 3005: "question",
 }
+_TAPBACK_SYMBOLS = {
+    "love": "❤️",
+    "like": "👍",
+    "dislike": "👎",
+    "laugh": "😂",
+    "emphasize": "❗",
+    "question": "❓",
+}
 
 # Webhook event types that carry user messages
-_MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
+_MESSAGE_EVENTS = {"new-message", "message", "updated-message", "reaction", "tapback"}
 
 # Log redaction patterns
 _PHONE_RE = re.compile(r"\+?\d{7,15}")
@@ -129,6 +137,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: Dict[str, str] = {}
+        self._tapback_dedup = MessageDeduplicator(max_size=1000, ttl_seconds=300)
 
     # ------------------------------------------------------------------
     # API helpers
@@ -765,6 +774,39 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 return candidate.strip()
         return None
 
+    @staticmethod
+    def _tapback_text(associated_type: Any) -> Optional[str]:
+        if not isinstance(associated_type, int):
+            return None
+        removed = associated_type in _TAPBACK_REMOVED
+        reaction = _TAPBACK_REMOVED.get(associated_type) or _TAPBACK_ADDED.get(associated_type)
+        if not reaction:
+            return None
+        symbol = _TAPBACK_SYMBOLS.get(reaction, reaction)
+        verb = "Removed reaction" if removed else "Reacted"
+        return f"{verb} {symbol} to a previous message"
+
+    def _tapback_dedup_key(self, record: Dict[str, Any], sender: str) -> Optional[str]:
+        associated_type = record.get("associatedMessageType")
+        if self._tapback_text(associated_type) is None:
+            return None
+
+        associated_guid = self._value(
+            record.get("associatedMessageGuid"),
+            record.get("threadOriginatorGuid"),
+        )
+        if associated_guid and sender:
+            return f"tapback:{sender}:{associated_guid}:{associated_type}"
+
+        message_guid = self._value(
+            record.get("guid"),
+            record.get("messageGuid"),
+            record.get("id"),
+        )
+        if message_guid:
+            return f"tapback:{message_guid}"
+        return None
+
     async def _handle_webhook(self, request):
         from aiohttp import web
 
@@ -811,16 +853,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if is_from_me:
             return web.Response(text="ok")
 
-        # Skip tapback reactions delivered as messages
         assoc_type = record.get("associatedMessageType")
-        if isinstance(assoc_type, int) and assoc_type in {
-            **_TAPBACK_ADDED,
-            **_TAPBACK_REMOVED,
-        }:
-            return web.Response(text="ok")
+        tapback_text = self._tapback_text(assoc_type)
 
         text = (
-            self._value(
+            tapback_text
+            or self._value(
                 record.get("text"), record.get("message"), record.get("body")
             )
             or ""
@@ -897,6 +935,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             chat_identifier = sender
         if not sender or not (chat_guid or chat_identifier) or not text:
             return web.json_response({"error": "missing message fields"}, status=400)
+
+        if tapback_text:
+            dedup_key = self._tapback_dedup_key(record, sender)
+            if dedup_key and self._tapback_dedup.is_duplicate(dedup_key):
+                return web.Response(text="ok")
 
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
