@@ -823,6 +823,21 @@ async def test_run_agent_defers_background_review_notification_until_release(mon
 
 
 @pytest.mark.asyncio
+async def test_run_agent_suppresses_background_review_notification_when_off(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-bg-review-off",
+        config_data={"display": {"background_process_notifications": "off"}},
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert adapter._post_delivery_callbacks == {}
+
+
+@pytest.mark.asyncio
 async def test_base_processing_releases_post_delivery_callback_after_main_send():
     """Post-delivery callbacks on the adapter fire after the main response."""
     adapter = ProgressCaptureAdapter()
